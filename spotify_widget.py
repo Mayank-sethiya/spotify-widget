@@ -22,6 +22,8 @@ from spotipy.oauth2 import SpotifyOAuth
 # --- Windows Media Control ---
 try:
     from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as SessionManager
+    import ctypes
+    from ctypes import wintypes
     IS_WINDOWS = True
 except ImportError:
     IS_WINDOWS = False
@@ -29,11 +31,18 @@ except ImportError:
 
 # --- WIDGET CONFIGURATION ---
 INITIAL_WIDGET_SIZE = 250
+MIN_WIDGET_SIZE = 180
+MAX_WIDGET_SIZE = 600
+CORNER_RADIUS = 24
+OVERLAY_ALPHA = 0.4
 FONT_NAME = "Segoe UI"
 UPDATE_DELAY_S = 1.0
 CONFIG_FILE = "config.json"
 REDIRECT_URI = "http://127.0.0.1:8888/callback"
 NETWORK_TIMEOUT = 6
+
+# Desktop pinning (Windows only)
+PIN_TO_DESKTOP = True
 
 # Safe-mode toggles via env vars
 ENABLE_TRANSPARENCY = os.getenv("ENABLE_TRANSPARENCY", "0") == "1"
@@ -62,6 +71,63 @@ def create_rounded_image(pil_image: Image.Image, size: tuple[int, int], radius: 
 
 def rgb_to_8bit_tuple(rgb16: tuple[int, int, int]) -> tuple[int, int, int]:
     return tuple(int(v / 257) for v in rgb16)
+
+def pin_to_desktop(hwnd):
+    """Attempt to pin the window to the Windows desktop layer."""
+    if not IS_WINDOWS or not PIN_TO_DESKTOP:
+        return False
+    
+    try:
+        # Get required Windows APIs
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        
+        # Find Progman window
+        progman = user32.FindWindowW("Progman", None)
+        if not progman:
+            logging.warning("Could not find Progman window")
+            return False
+        
+        # Send message to spawn WorkerW
+        user32.SendMessageTimeoutW(progman, 0x052C, 0, 0, 0x0000, 1000, None)
+        
+        # Find WorkerW window that contains SHELLDLL_DefView
+        def enum_windows_proc(hwnd, lParam):
+            class_name = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(hwnd, class_name, 256)
+            if class_name.value == "WorkerW":
+                # Check if this WorkerW contains SHELLDLL_DefView
+                shelldll = user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None)
+                if shelldll:
+                    # Store the WorkerW handle
+                    ctypes.cast(lParam, ctypes.POINTER(wintypes.HWND)).contents = wintypes.HWND(hwnd)
+                    return False  # Stop enumeration
+            return True
+        
+        # Setup enumeration
+        EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        enum_proc = EnumWindowsProc(enum_windows_proc)
+        workerw = wintypes.HWND()
+        
+        # Enumerate windows to find the correct WorkerW
+        user32.EnumWindows(enum_proc, ctypes.cast(ctypes.pointer(workerw), wintypes.LPARAM))
+        
+        if not workerw.value:
+            logging.warning("Could not find WorkerW window")
+            return False
+        
+        # Set parent to WorkerW to pin to desktop
+        result = user32.SetParent(hwnd, workerw.value)
+        if result:
+            logging.info("Successfully pinned window to desktop")
+            return True
+        else:
+            logging.warning("Failed to set parent to WorkerW")
+            return False
+            
+    except Exception as e:
+        logging.warning(f"Desktop pinning failed: {e}")
+        return False
 
 @dataclass
 class AppConfig:
@@ -113,6 +179,9 @@ class SpotifyWidget:
         self.root = root
         self.config = config
         self.widget_size = INITIAL_WIDGET_SIZE
+        self._is_resizing = False
+        self._resize_start_pos = None
+        self._start_size = None
 
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.widget_size}x{self.widget_size}+200+200")
@@ -125,6 +194,10 @@ class SpotifyWidget:
 
         self.root.attributes("-topmost", False)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Try to pin to desktop on Windows
+        if IS_WINDOWS and PIN_TO_DESKTOP:
+            self.root.after(100, self._try_pin_to_desktop)
 
         self.canvas = tk.Canvas(root, bg="grey", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -148,31 +221,101 @@ class SpotifyWidget:
         self._spotify_thread.start()
         self._animate_progress_bar()
 
+    def _try_pin_to_desktop(self):
+        """Try to pin the window to desktop after it's fully initialized."""
+        try:
+            hwnd = self.root.winfo_id()
+            if pin_to_desktop(hwnd):
+                logging.info("Widget pinned to desktop successfully")
+            else:
+                logging.info("Running as normal window (desktop pinning failed)")
+        except Exception as e:
+            logging.warning(f"Error trying to pin to desktop: {e}")
+
     def _bind_events(self):
-        self.canvas.bind("<ButtonPress-1>", self._start_move)
-        self.canvas.bind("<B1-Motion>", self._do_move)
-        self.root.bind("<Enter>", self._on_enter)
-        self.root.bind("<Leave>", self._on_leave)
+        self.canvas.bind("<ButtonPress-1>", self._start_move_or_resize)
+        self.canvas.bind("<B1-Motion>", self._do_move_or_resize)
+        self.canvas.bind("<ButtonRelease-1>", self._end_move_or_resize)
         self.canvas.bind("<Button-2>", self._force_refresh)
         self.canvas.bind("<Button-3>", lambda e: self._on_close())
+        
+        # Ctrl+MouseWheel for resizing
+        self.root.bind("<Control-MouseWheel>", self._ctrl_mousewheel_resize)
+        self.root.bind("<Control-Button-4>", self._ctrl_mousewheel_resize)  # Linux scroll up
+        self.root.bind("<Control-Button-5>", self._ctrl_mousewheel_resize)  # Linux scroll down
 
-    def _start_move(self, event):
-        self._x, self._y = event.x, event.y
+    def _is_in_resize_handle(self, x, y):
+        """Check if the click is in the resize handle area (bottom-right corner)."""
+        handle_size = 20
+        return (x >= self.widget_size - handle_size and 
+                y >= self.widget_size - handle_size)
 
-    def _do_move(self, event):
+    def _start_move_or_resize(self, event):
+        if self._is_in_resize_handle(event.x, event.y):
+            self._is_resizing = True
+            self._resize_start_pos = (event.x_root, event.y_root)
+            self._start_size = self.widget_size
+            self.canvas.config(cursor="se-resize")
+        else:
+            self._is_resizing = False
+            self._x, self._y = event.x, event.y
+            self.canvas.config(cursor="fleur")
+
+    def _do_move_or_resize(self, event):
         try:
-            deltax, deltay = event.x - self._x, event.y - self._y  # fixed: _y
-            self.root.geometry(f"+{{self.root.winfo_x() + deltax}}+{{self.root.winfo_y() + deltay}}")
+            if self._is_resizing and self._resize_start_pos:
+                # Handle resizing
+                dx = event.x_root - self._resize_start_pos[0]
+                dy = event.y_root - self._resize_start_pos[1]
+                # Use the larger of dx or dy to maintain square aspect ratio
+                delta = max(dx, dy)
+                new_size = max(MIN_WIDGET_SIZE, min(MAX_WIDGET_SIZE, self._start_size + delta))
+                if new_size != self.widget_size:
+                    self._resize_widget(new_size)
+            else:
+                # Handle moving
+                deltax, deltay = event.x - self._x, event.y - self._y
+                new_x = self.root.winfo_x() + deltax
+                new_y = self.root.winfo_y() + deltay
+                self.root.geometry(f"+{new_x}+{new_y}")
         except Exception as e:
-            logging.warning(f"Move error: {{e}}")
+            logging.warning(f"Move/resize error: {e}")
 
-    def _on_enter(self, _event):
-        self.canvas.itemconfigure("overlay", state="normal")
-        self.canvas.itemconfigure("controls", state="normal")
+    def _end_move_or_resize(self, event):
+        self._is_resizing = False
+        self._resize_start_pos = None
+        self._start_size = None
+        self.canvas.config(cursor="")
 
-    def _on_leave(self, _event):
-        self.canvas.itemconfigure("overlay", state="hidden")
-        self.canvas.itemconfigure("controls", state="hidden")
+    def _ctrl_mousewheel_resize(self, event):
+        """Handle Ctrl+MouseWheel resizing."""
+        if hasattr(event, 'delta'):
+            # Windows
+            delta = event.delta
+        else:
+            # Linux
+            if event.num == 4:
+                delta = 120
+            elif event.num == 5:
+                delta = -120
+            else:
+                return
+        
+        # Determine resize direction
+        if delta > 0:
+            new_size = min(MAX_WIDGET_SIZE, self.widget_size + 20)
+        else:
+            new_size = max(MIN_WIDGET_SIZE, self.widget_size - 20)
+        
+        if new_size != self.widget_size:
+            self._resize_widget(new_size)
+
+    def _resize_widget(self, new_size):
+        """Resize the widget to the new size."""
+        self.widget_size = new_size
+        self.root.geometry(f"{new_size}x{new_size}")
+        self._album_art_cache_key = None  # Force album art to be regenerated
+        self.root.after_idle(self.update_ui_with_state)
 
     def _force_refresh(self, _event=None):
         self._fetch_playback_data(schedule_ui=True)
@@ -196,14 +339,14 @@ class SpotifyWidget:
 
             pil_art: Optional[Image.Image] = song_info.get("album_art_pil")
             if pil_art is not None:
-                cache_key = f"album_{{self.widget_size}}"
+                cache_key = f"album_{self.widget_size}"
                 if self._album_art_cache_key != cache_key:
-                    rounded_art = create_rounded_image(pil_art, (self.widget_size, self.widget_size), 20)
+                    rounded_art = create_rounded_image(pil_art, (self.widget_size, self.widget_size), CORNER_RADIUS)
                     self.tk_image_references["album_art"] = ImageTk.PhotoImage(rounded_art)
                     self._album_art_cache_key = cache_key
                 self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image_references["album_art"])
             else:
-                self._draw_rounded_rect(0, 0, self.widget_size, self.widget_size, 20, "black", alpha=1.0)
+                self._draw_rounded_rect(0, 0, self.widget_size, self.widget_size, CORNER_RADIUS, "black", alpha=1.0)
 
             self._create_overlay_elements(song_info, is_playing)
         except Exception as e:
@@ -217,7 +360,7 @@ class SpotifyWidget:
             song_name_text = "Spotify Idle"
             artist_name_text = "Hover to control"
 
-        self._draw_rounded_rect(0, 0, self.widget_size, self.widget_size, 20, "black", alpha=0.5, tags="overlay")
+        self._draw_rounded_rect(0, 0, self.widget_size, self.widget_size, CORNER_RADIUS, "black", alpha=OVERLAY_ALPHA, tags="overlay")
 
         font_size_song = max(9, int(self.widget_size / 16))
         font_size_artist = max(8, int(self.widget_size / 20))
@@ -238,8 +381,7 @@ class SpotifyWidget:
         )
 
         self._draw_control_icons(is_playing)
-        self.canvas.itemconfigure("overlay", state="hidden")
-        self.canvas.itemconfigure("controls", state="hidden")
+        self._draw_resize_grip()
 
     def _draw_control_icons(self, is_playing: bool, hover_state: Optional[str] = None):
         self.canvas.delete("controls")
@@ -304,9 +446,25 @@ class SpotifyWidget:
             self.canvas.tag_bind("play_btn", "<Button-1>", lambda e: self._toggle_play_pause())
             self.canvas.tag_bind("next_btn", "<Button-1>", lambda e: self._next_track())
 
+    def _draw_resize_grip(self):
+        """Draw a subtle resize grip in the bottom-right corner."""
+        grip_size = 12
+        grip_x = self.widget_size - grip_size - 4
+        grip_y = self.widget_size - grip_size - 4
+        
+        # Draw small diagonal lines to indicate resize handle
+        for i in range(3):
+            x1 = grip_x + i * 3
+            y1 = grip_y + grip_size - 2
+            x2 = grip_x + grip_size - 2
+            y2 = grip_y + i * 3
+            self.canvas.create_line(x1, y1, x2, y2, fill="white", width=1, tags="resize_grip")
+            # Add subtle shadow
+            self.canvas.create_line(x1+1, y1+1, x2+1, y2+1, fill="black", width=1, tags="resize_grip")
+
     def _draw_rounded_rect(self, x1, y1, x2, y2, radius, fill, alpha=1.0, tags=""):
         width, height = (x2 - x1), (y2 - y1)
-        cache_key = f"rect_{{fill}}_{{alpha}}_{{width}}x{{height}}_{{radius}}"
+        cache_key = f"rect_{fill}_{alpha}_{width}x{height}_{radius}"
         img_ref = getattr(self, "_overlay_cache", {}).get(cache_key)
         if img_ref is None:
             img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
