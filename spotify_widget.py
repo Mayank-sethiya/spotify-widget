@@ -139,6 +139,7 @@ class SpotifyWidget:
         self.drag_locked = False
         self._last_x = 0
         self._last_y = 0
+        self._pinned_to_desktop = False
 
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.widget_size}x{self.widget_size}+200+200")
@@ -170,6 +171,10 @@ class SpotifyWidget:
         self._bind_events()
         self.update_ui_with_state()
 
+        # Try to pin to desktop on Windows if enabled
+        if IS_WINDOWS and PIN_TO_DESKTOP:
+            self._pin_to_desktop()
+
         logging.info("Starting Spotify background thread")
         self._spotify_thread = threading.Thread(target=self._spotify_update_loop, daemon=True, name="SpotifyLoop")
         self._spotify_thread.start()
@@ -199,10 +204,28 @@ class SpotifyWidget:
         self.root.bind("<Enter>", self._on_enter)
         self.root.bind("<Leave>", self._on_leave)
         self.canvas.bind("<Button-2>", self._force_refresh)
-        self.canvas.bind("<Button-3>", lambda e: self._on_close())
+        self.canvas.bind("<Button-3>", self._show_context_menu)  # Right-click context menu
         # Resize with Ctrl+MouseWheel
         self.root.bind("<Control-Button-4>", self._resize_up)
         self.root.bind("<Control-Button-5>", self._resize_down)
+
+    def _show_context_menu(self, event):
+        """Show context menu with additional options"""
+        try:
+            context_menu = tk.Menu(self.root, tearoff=0)
+            context_menu.add_command(label="Select Device", command=self._show_device_picker)
+            context_menu.add_command(label="Refresh", command=self._force_refresh)
+            context_menu.add_separator()
+            context_menu.add_command(label=f"{'Unlock' if self.drag_locked else 'Lock'} Position", command=self._toggle_drag_lock)
+            if IS_WINDOWS:
+                pin_text = "Unpin from Desktop" if self._pinned_to_desktop else "Pin to Desktop"
+                context_menu.add_command(label=pin_text, command=self._toggle_desktop_pin)
+            context_menu.add_separator()
+            context_menu.add_command(label="Exit", command=self._on_close)
+            
+            context_menu.post(event.x_root, event.y_root)
+        except Exception as e:
+            logging.exception(f"Context menu error: {e}")
 
     def _start_move(self, event):
         if not self.drag_locked:
@@ -502,6 +525,177 @@ class SpotifyWidget:
         self.canvas.tag_bind("play_btn", "<Button-1>", lambda e: self._toggle_play_pause())
         self.canvas.tag_bind("next_btn", "<Button-1>", lambda e: self._next_track())
 
+    def _get_available_devices(self):
+        """Get list of available Spotify Connect devices"""
+        try:
+            if self.sp:
+                devices = self.sp.devices()
+                return devices.get("devices", [])
+        except Exception as e:
+            logging.exception(f"Failed to get devices: {e}")
+        return []
+
+    def _show_device_picker(self):
+        """Show device picker dialog"""
+        devices = self._get_available_devices()
+        if not devices:
+            messagebox.showinfo("No Devices", "No Spotify Connect devices found. Make sure Spotify is running on at least one device.")
+            return
+
+        # Create device picker window
+        device_window = tk.Toplevel(self.root)
+        device_window.title("Select Spotify Device")
+        device_window.geometry("300x200")
+        device_window.resizable(False, False)
+        device_window.attributes("-topmost", True)
+
+        tk.Label(device_window, text="Select device for playback:", font=(FONT_NAME, 10)).pack(pady=10)
+
+        # Device listbox
+        listbox = tk.Listbox(device_window, font=(FONT_NAME, 9))
+        listbox.pack(fill="both", expand=True, padx=10, pady=5)
+
+        device_info = []
+        for device in devices:
+            name = device.get("name", "Unknown Device")
+            device_type = device.get("type", "").title()
+            is_active = device.get("is_active", False)
+            status = " (Active)" if is_active else ""
+            display_text = f"{name} - {device_type}{status}"
+            listbox.insert(tk.END, display_text)
+            device_info.append(device)
+
+        def transfer_to_selected():
+            try:
+                selection = listbox.curselection()
+                if selection:
+                    device = device_info[selection[0]]
+                    device_id = device.get("id")
+                    if device_id:
+                        self._transfer_playback(device_id)
+                        device_window.destroy()
+                else:
+                    messagebox.showwarning("No Selection", "Please select a device.")
+            except Exception as e:
+                logging.exception(f"Device selection error: {e}")
+
+        button_frame = tk.Frame(device_window)
+        button_frame.pack(pady=10)
+        
+        tk.Button(button_frame, text="Transfer Playback", command=transfer_to_selected).pack(side="left", padx=5)
+        tk.Button(button_frame, text="Cancel", command=device_window.destroy).pack(side="left", padx=5)
+
+        # Select current active device if any
+        for i, device in enumerate(device_info):
+            if device.get("is_active"):
+                listbox.selection_set(i)
+                break
+
+    def _transfer_playback(self, device_id: str):
+        """Transfer playback to specified device"""
+        def transfer_task():
+            try:
+                if self.sp:
+                    self.sp.transfer_playback(device_id, force_play=True)
+                    logging.info(f"Transferred playback to device: {device_id}")
+                    # Refresh playback state after transfer
+                    time.sleep(1)  # Give it a moment to transfer
+                    self._fetch_playback_data(schedule_ui=True)
+            except Exception as e:
+                logging.exception(f"Failed to transfer playback: {e}")
+                self._schedule_ui_update(lambda: messagebox.showerror("Transfer Failed", f"Could not transfer playback: {e}"))
+        
+        threading.Thread(target=transfer_task, daemon=True).start()
+
+    def _pin_to_desktop(self):
+        """Pin widget to Windows desktop (behind icons)"""
+        if not IS_WINDOWS:
+            return
+            
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            # Get window handles
+            hwnd = self.root.winfo_id()
+            
+            # Find the desktop WorkerW window
+            def enum_windows_proc(hwnd, lparam):
+                class_name = ctypes.create_unicode_buffer(256)
+                ctypes.windll.user32.GetClassNameW(hwnd, class_name, 256)
+                if class_name.value == "WorkerW":
+                    # Check if this WorkerW contains the desktop listview
+                    child_hwnd = ctypes.windll.user32.FindWindowExW(hwnd, 0, "SHELLDLL_DefView", None)
+                    if child_hwnd:
+                        # This is the right WorkerW, store it
+                        lparam.contents = wintypes.HWND(hwnd)
+                        return False  # Stop enumeration
+                return True  # Continue enumeration
+            
+            # Trigger creation of WorkerW by sending message to Program Manager
+            progman = ctypes.windll.user32.FindWindowW("Progman", None)
+            ctypes.windll.user32.SendMessageW(progman, 0x052C, 0xD, 0)
+            ctypes.windll.user32.SendMessageW(progman, 0x052C, 0xD, 1)
+            
+            # Find the WorkerW window
+            workerw = wintypes.HWND()
+            enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            ctypes.windll.user32.EnumWindows(enum_proc(enum_windows_proc), ctypes.byref(workerw))
+            
+            if workerw.value:
+                # Set our window as child of WorkerW
+                ctypes.windll.user32.SetParent(hwnd, workerw.value)
+                self._pinned_to_desktop = True
+                logging.info("Successfully pinned to desktop")
+            else:
+                logging.warning("Could not find WorkerW window for desktop pinning")
+                
+        except Exception as e:
+            logging.warning(f"Desktop pinning failed: {e}")
+
+    def _unpin_from_desktop(self):
+        """Unpin widget from Windows desktop"""
+        if not IS_WINDOWS or not self._pinned_to_desktop:
+            return
+            
+        try:
+            import ctypes
+            hwnd = self.root.winfo_id()
+            # Remove from WorkerW and make it a normal window
+            ctypes.windll.user32.SetParent(hwnd, 0)
+            self._pinned_to_desktop = False
+            logging.info("Unpinned from desktop")
+        except Exception as e:
+            logging.warning(f"Desktop unpinning failed: {e}")
+
+    def _toggle_desktop_pin(self):
+        """Toggle desktop pinning state"""
+        if self._pinned_to_desktop:
+            self._unpin_from_desktop()
+    def _handle_spotify_api_error(self, error, action):
+        """Handle Spotify API errors with user-friendly messages"""
+        error_msg = str(error)
+        if "No active device found" in error_msg:
+            self._schedule_ui_update(lambda: messagebox.showwarning(
+                "No Active Device", 
+                f"Cannot {action}: No active Spotify device found.\n\nPlease:\n1. Open Spotify on any device\n2. Start playing something\n3. Try again, or use 'Select Device' to transfer playback."
+            ))
+        elif "Insufficient client scope" in error_msg:
+            self._schedule_ui_update(lambda: messagebox.showerror(
+                "Permission Error",
+                f"Cannot {action}: Insufficient permissions.\n\nPlease restart the widget to re-authorize with required permissions."
+            ))
+        elif "Device not found" in error_msg:
+            self._schedule_ui_update(lambda: messagebox.showwarning(
+                "Device Error",
+                f"Cannot {action}: Selected device is no longer available.\n\nTry selecting a different device."
+            ))
+        else:
+            self._schedule_ui_update(lambda: messagebox.showerror(
+                "Spotify Error",
+                f"Cannot {action}: {error_msg[:100]}..."
+            ))
+
     def _draw_rounded_rect(self, x1, y1, x2, y2, radius, fill, alpha=1.0, tags=""):
         width, height = (x2 - x1), (y2 - y1)
         cache_key = f"rect_{fill}_{alpha}_{width}x{height}_{radius}"
@@ -674,7 +868,7 @@ class SpotifyWidget:
                             self.sp.start_playback()
                             logging.info("Started playback via Spotify API")
                     except Exception as e:
-                        logging.warning(f"Spotify API control failed: {e}")
+                        self._handle_spotify_api_error(e, "play/pause")
                         # Fallback to Windows API
                         if IS_WINDOWS:
                             asyncio.run(self._win_control("play_pause"))
@@ -698,7 +892,7 @@ class SpotifyWidget:
                         self.sp.next_track()
                         logging.info("Next track via Spotify API")
                     except Exception as e:
-                        logging.warning(f"Spotify API next failed: {e}")
+                        self._handle_spotify_api_error(e, "skip to next track")
                         # Fallback to Windows API
                         if IS_WINDOWS:
                             asyncio.run(self._win_control("next"))
@@ -722,7 +916,7 @@ class SpotifyWidget:
                         self.sp.previous_track()
                         logging.info("Previous track via Spotify API")
                     except Exception as e:
-                        logging.warning(f"Spotify API previous failed: {e}")
+                        self._handle_spotify_api_error(e, "skip to previous track")
                         # Fallback to Windows API
                         if IS_WINDOWS:
                             asyncio.run(self._win_control("prev"))
