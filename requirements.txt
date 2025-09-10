@@ -1,0 +1,4 @@
+spotipy>=2.24.0
+Pillow>=10.4.0
+requests>=2.32.0
+winsdk>=1.0.0; platform_system=="Windows"
