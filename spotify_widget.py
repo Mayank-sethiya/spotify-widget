@@ -10,6 +10,8 @@ import os
 import sys
 import asyncio
 import logging
+import ctypes
+from ctypes import wintypes
 
 # Image + network
 from PIL import Image, ImageTk, ImageDraw
@@ -27,6 +29,9 @@ except ImportError:
     IS_WINDOWS = False
     print("Windows-specific libraries not found. Controls will be disabled.")
 
+# --- Windows Platform Detection ---
+IS_WINDOWS = sys.platform.startswith("win")
+
 # --- WIDGET CONFIGURATION ---
 INITIAL_WIDGET_SIZE = 250
 FONT_NAME = "Segoe UI"
@@ -37,6 +42,7 @@ NETWORK_TIMEOUT = 6
 
 # Safe-mode toggles via env vars
 ENABLE_TRANSPARENCY = os.getenv("ENABLE_TRANSPARENCY", "0") == "1"
+PIN_TO_DESKTOP = os.getenv("PIN_TO_DESKTOP", "0") == "1"
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
 logging.basicConfig(
@@ -62,6 +68,86 @@ def create_rounded_image(pil_image: Image.Image, size: tuple[int, int], radius: 
 
 def rgb_to_8bit_tuple(rgb16: tuple[int, int, int]) -> tuple[int, int, int]:
     return tuple(int(v / 257) for v in rgb16)
+
+# --- Windows-specific functions for pin-to-desktop ---
+if IS_WINDOWS:
+    try:
+        # Load user32 and define SetWindowPos
+        user32 = ctypes.windll.user32
+        
+        # SetWindowPos constants
+        SWP_NOSIZE = 0x0001
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        
+        # Define SetWindowPos function signature
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,  # hWnd
+            wintypes.HWND,  # hWndInsertAfter
+            ctypes.c_int,   # X
+            ctypes.c_int,   # Y
+            ctypes.c_int,   # cx
+            ctypes.c_int,   # cy
+            wintypes.UINT   # uFlags
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        
+        # Functions to find and reparent to desktop
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        
+        user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowExW.restype = wintypes.HWND
+        
+        user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
+        user32.SetParent.restype = wintypes.HWND
+        
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.SendMessageW.restype = wintypes.LRESULT
+        
+        user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        
+        def _pin_to_desktop(hwnd):
+            """Pin window to desktop by reparenting to WorkerW window"""
+            try:
+                # Find the WorkerW window (desktop)
+                progman = user32.FindWindowW("Progman", None)
+                if progman:
+                    # Send message to create WorkerW window
+                    user32.SendMessageW(progman, 0x052C, 0, 0)
+                    
+                    # Find WorkerW window
+                    workerw = None
+                    def enum_windows_proc(hwnd, lparam):
+                        nonlocal workerw
+                        if user32.FindWindowExW(hwnd, None, "SHELLDLL_DefView", None):
+                            workerw = user32.FindWindowExW(None, hwnd, "WorkerW", None)
+                        return True
+                    
+                    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(enum_windows_proc)
+                    user32.EnumWindows(enum_proc, 0)
+                    
+                    if workerw:
+                        # Reparent window to WorkerW (desktop)
+                        user32.SetParent(hwnd, workerw)
+                        logging.info("Window pinned to desktop")
+                        return True
+                    else:
+                        logging.warning("Could not find WorkerW window")
+                return False
+            except Exception as e:
+                logging.exception(f"Failed to pin window to desktop: {e}")
+                return False
+                
+        HAS_WIN32_SUPPORT = True
+    except Exception as e:
+        logging.warning(f"Windows API support unavailable: {e}")
+        HAS_WIN32_SUPPORT = False
+        user32 = None
+else:
+    HAS_WIN32_SUPPORT = False
+    user32 = None
 
 @dataclass
 class AppConfig:
@@ -113,6 +199,8 @@ class SpotifyWidget:
         self.root = root
         self.config = config
         self.widget_size = INITIAL_WIDGET_SIZE
+        self.pinned_to_desktop = False
+        self.last_move_time = 0.0  # For throttling move operations
 
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.widget_size}x{self.widget_size}+200+200")
@@ -125,6 +213,22 @@ class SpotifyWidget:
 
         self.root.attributes("-topmost", False)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Pin to desktop if requested
+        if IS_WINDOWS and PIN_TO_DESKTOP and HAS_WIN32_SUPPORT:
+            self.root.update()  # Ensure window is created
+            hwnd = int(self.root.wm_frame(), 16) if hasattr(self.root, 'wm_frame') else None
+            if not hwnd:
+                # Alternative method to get window handle
+                try:
+                    hwnd = user32.FindWindowW(None, self.root.wm_title())
+                except:
+                    pass
+            if hwnd and _pin_to_desktop(hwnd):
+                self.pinned_to_desktop = True
+                logging.info("Widget pinned to desktop")
+            else:
+                logging.warning("Failed to pin widget to desktop")
 
         self.canvas = tk.Canvas(root, bg="grey", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
@@ -159,12 +263,52 @@ class SpotifyWidget:
     def _start_move(self, event):
         self._x, self._y = event.x, event.y
 
+    def _move_window(self, x: int, y: int):
+        """Move window using appropriate method based on platform and pin state"""
+        try:
+            if IS_WINDOWS and self.pinned_to_desktop and HAS_WIN32_SUPPORT and user32:
+                # Use SetWindowPos when pinned to desktop on Windows
+                hwnd = int(self.root.wm_frame(), 16) if hasattr(self.root, 'wm_frame') else None
+                if not hwnd:
+                    # Alternative method to get window handle
+                    hwnd = user32.FindWindowW(None, self.root.wm_title())
+                
+                if hwnd:
+                    success = user32.SetWindowPos(
+                        hwnd, None, x, y, 0, 0, 
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                    )
+                    if not success:
+                        # Fallback to Tk geometry if SetWindowPos fails
+                        self.root.geometry(f"+{x}+{y}")
+                else:
+                    # Fallback to Tk geometry if can't get window handle
+                    self.root.geometry(f"+{x}+{y}")
+            else:
+                # Use Tk geometry for non-Windows or non-pinned windows
+                self.root.geometry(f"+{x}+{y}")
+        except Exception as e:
+            logging.exception("Error moving window")
+            # Try fallback to Tk geometry
+            try:
+                self.root.geometry(f"+{x}+{y}")
+            except Exception:
+                logging.exception("Fallback move also failed")
+
     def _do_move(self, event):
         try:
+            # Throttle move updates to ~60 Hz (1/60 ≈ 0.0167 seconds)
+            now = time.time()
+            if now - self.last_move_time < 1.0 / 60.0:
+                return
+            self.last_move_time = now
+            
             deltax, deltay = event.x - self._x, event.y - self._y  # fixed: _y
-            self.root.geometry(f"+{{self.root.winfo_x() + deltax}}+{{self.root.winfo_y() + deltay}}")
+            new_x = self.root.winfo_x() + deltax
+            new_y = self.root.winfo_y() + deltay
+            self._move_window(new_x, new_y)
         except Exception as e:
-            logging.warning(f"Move error: {{e}}")
+            logging.exception("Move error while dragging")
 
     def _on_enter(self, _event):
         self.canvas.itemconfigure("overlay", state="normal")
