@@ -10,6 +10,7 @@ import os
 import sys
 import asyncio
 import logging
+import queue
 
 # Image + network
 from PIL import Image, ImageTk, ImageDraw
@@ -38,12 +39,28 @@ NETWORK_TIMEOUT = 6
 # Safe-mode toggles via env vars
 ENABLE_TRANSPARENCY = os.getenv("ENABLE_TRANSPARENCY", "0") == "1"
 DEBUG = os.getenv("DEBUG", "0") == "1"
+LOW_END_MODE = os.getenv("LOW_END_MODE", "0") == "1"
+PIN_TO_DESKTOP = os.getenv("PIN_TO_DESKTOP", "1") == "1" if IS_WINDOWS else False
+
+# Performance settings based on LOW_END_MODE
+PROGRESS_BAR_FPS = 4 if LOW_END_MODE else 20
+UI_REFRESH_DELAY = 250 if LOW_END_MODE else 50
+NETWORK_POLL_DELAY = 1000 if LOW_END_MODE else 750
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format="%(asctime)s %(levelname)s %(threadName)s %(message)s",
     handlers=[logging.FileHandler("widget.log", mode="w", encoding="utf-8"), logging.StreamHandler(sys.stdout)],
 )
+
+# Log configuration at startup
+logging.info("Spotify Widget starting up")
+logging.info(f"LOW_END_MODE: {LOW_END_MODE}")
+logging.info(f"PIN_TO_DESKTOP: {PIN_TO_DESKTOP}")
+logging.info(f"ENABLE_TRANSPARENCY: {ENABLE_TRANSPARENCY}")
+logging.info(f"DEBUG: {DEBUG}")
+logging.info(f"Progress bar FPS: {PROGRESS_BAR_FPS}")
+logging.info(f"UI refresh delay: {UI_REFRESH_DELAY}ms")
 
 def resource_path(relative_path: str) -> str:
     try:
@@ -114,6 +131,15 @@ class SpotifyWidget:
         self.config = config
         self.widget_size = INITIAL_WIDGET_SIZE
 
+        # Thread-safe UI update queue
+        self.ui_queue = queue.Queue()
+        self._process_ui_queue()
+
+        # State tracking
+        self.drag_locked = False
+        self._last_x = 0
+        self._last_y = 0
+
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.widget_size}x{self.widget_size}+200+200")
         self.root.config(bg="grey")
@@ -137,6 +163,7 @@ class SpotifyWidget:
         self._song_state: Dict[str, Any] = {}
         self.tk_image_references: Dict[str, ImageTk.PhotoImage] = {}
         self._album_art_cache_key: Optional[str] = None
+        self._album_art_cache: Dict[str, Image.Image] = {}  # Cache album art by URL
         self._stop_event = threading.Event()
         self._overlay_cache: Dict[str, ImageTk.PhotoImage] = {}
 
@@ -148,6 +175,24 @@ class SpotifyWidget:
         self._spotify_thread.start()
         self._animate_progress_bar()
 
+    def _process_ui_queue(self):
+        """Process UI updates from background threads safely on main thread"""
+        try:
+            while True:
+                try:
+                    update_func = self.ui_queue.get_nowait()
+                    update_func()
+                except queue.Empty:
+                    break
+        except Exception as e:
+            logging.exception(f"UI queue processing error: {e}")
+        finally:
+            self.root.after(100, self._process_ui_queue)
+
+    def _schedule_ui_update(self, update_func):
+        """Thread-safe way to schedule UI updates from background threads"""
+        self.ui_queue.put(update_func)
+
     def _bind_events(self):
         self.canvas.bind("<ButtonPress-1>", self._start_move)
         self.canvas.bind("<B1-Motion>", self._do_move)
@@ -155,27 +200,79 @@ class SpotifyWidget:
         self.root.bind("<Leave>", self._on_leave)
         self.canvas.bind("<Button-2>", self._force_refresh)
         self.canvas.bind("<Button-3>", lambda e: self._on_close())
+        # Resize with Ctrl+MouseWheel
+        self.root.bind("<Control-Button-4>", self._resize_up)
+        self.root.bind("<Control-Button-5>", self._resize_down)
 
     def _start_move(self, event):
-        self._x, self._y = event.x, event.y
+        if not self.drag_locked:
+            self._x, self._y = event.x, event.y
 
     def _do_move(self, event):
+        if self.drag_locked:
+            return
         try:
-            deltax, deltay = event.x - self._x, event.y - self._y  # fixed: _y
-            self.root.geometry(f"+{{self.root.winfo_x() + deltax}}+{{self.root.winfo_y() + deltay}}")
+            deltax, deltay = event.x - self._x, event.y - self._y
+            # Use Windows API for pinned windows, geometry for others
+            if IS_WINDOWS and PIN_TO_DESKTOP:
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    
+                    # Throttle to ~60Hz for performance
+                    current_time = time.time()
+                    if hasattr(self, '_last_move_time') and current_time - self._last_move_time < 0.016:
+                        return
+                    self._last_move_time = current_time
+                    
+                    hwnd = self.root.winfo_id()
+                    new_x = self.root.winfo_x() + deltax
+                    new_y = self.root.winfo_y() + deltay
+                    ctypes.windll.user32.SetWindowPos(hwnd, 0, new_x, new_y, 0, 0, 0x0001)
+                except Exception as e:
+                    logging.debug(f"Windows SetWindowPos failed, falling back to geometry: {e}")
+                    self.root.geometry(f"+{self.root.winfo_x() + deltax}+{self.root.winfo_y() + deltay}")
+            else:
+                self.root.geometry(f"+{self.root.winfo_x() + deltax}+{self.root.winfo_y() + deltay}")
         except Exception as e:
-            logging.warning(f"Move error: {{e}}")
+            logging.warning(f"Move error: {e}")
+
+    def _resize_up(self, event):
+        """Resize widget larger with Ctrl+ScrollUp"""
+        try:
+            new_size = min(self.widget_size + 25, 500)
+            if new_size != self.widget_size:
+                self.widget_size = new_size
+                self.root.geometry(f"{self.widget_size}x{self.widget_size}")
+                self._album_art_cache_key = None  # Force refresh
+                self.update_ui_with_state()
+        except Exception as e:
+            logging.exception(f"Resize up error: {e}")
+
+    def _resize_down(self, event):
+        """Resize widget smaller with Ctrl+ScrollDown"""
+        try:
+            new_size = max(self.widget_size - 25, 150)
+            if new_size != self.widget_size:
+                self.widget_size = new_size
+                self.root.geometry(f"{self.widget_size}x{self.widget_size}")
+                self._album_art_cache_key = None  # Force refresh
+                self.update_ui_with_state()
+        except Exception as e:
+            logging.exception(f"Resize down error: {e}")
 
     def _on_enter(self, _event):
-        self.canvas.itemconfigure("overlay", state="normal")
-        self.canvas.itemconfigure("controls", state="normal")
+        # Controls are always visible, just update hover highlights
+        pass
 
     def _on_leave(self, _event):
-        self.canvas.itemconfigure("overlay", state="hidden")
-        self.canvas.itemconfigure("controls", state="hidden")
+        # Controls stay visible, just remove hover highlights  
+        self._draw_control_icons(self.is_playing, None)
 
     def _force_refresh(self, _event=None):
-        self._fetch_playback_data(schedule_ui=True)
+        def refresh_task():
+            self._fetch_playback_data(schedule_ui=True)
+        threading.Thread(target=refresh_task, daemon=True).start()
 
     def _on_close(self):
         self._stop_event.set()
@@ -196,7 +293,7 @@ class SpotifyWidget:
 
             pil_art: Optional[Image.Image] = song_info.get("album_art_pil")
             if pil_art is not None:
-                cache_key = f"album_{{self.widget_size}}"
+                cache_key = f"album_{self.widget_size}"
                 if self._album_art_cache_key != cache_key:
                     rounded_art = create_rounded_image(pil_art, (self.widget_size, self.widget_size), 20)
                     self.tk_image_references["album_art"] = ImageTk.PhotoImage(rounded_art)
@@ -207,7 +304,7 @@ class SpotifyWidget:
 
             self._create_overlay_elements(song_info, is_playing)
         except Exception as e:
-            logging.exception(f"UI update error: {{e}}")
+            logging.exception(f"UI update error: {e}")
 
     def _create_overlay_elements(self, song_info: Dict[str, Any], is_playing: bool):
         if song_info.get("song_name"):
@@ -217,7 +314,11 @@ class SpotifyWidget:
             song_name_text = "Spotify Idle"
             artist_name_text = "Hover to control"
 
+        # Draw overlay but keep it visible (not hidden like before)
         self._draw_rounded_rect(0, 0, self.widget_size, self.widget_size, 20, "black", alpha=0.5, tags="overlay")
+
+        # Add close and lock icons in top-right corner
+        self._draw_corner_icons()
 
         font_size_song = max(9, int(self.widget_size / 16))
         font_size_artist = max(8, int(self.widget_size / 20))
@@ -238,8 +339,105 @@ class SpotifyWidget:
         )
 
         self._draw_control_icons(is_playing)
-        self.canvas.itemconfigure("overlay", state="hidden")
-        self.canvas.itemconfigure("controls", state="hidden")
+        
+        # Add resize grip in bottom-right corner
+        self._draw_resize_grip()
+
+    def _draw_corner_icons(self):
+        """Draw close and lock icons in top-right corner"""
+        self.canvas.delete("corner_icons")
+        
+        icon_size = max(16, self.widget_size // 15)
+        margin = 8
+        
+        # Close icon (×)
+        close_x = self.widget_size - margin - icon_size
+        close_y = margin
+        
+        self.canvas.create_oval(
+            close_x, close_y, close_x + icon_size, close_y + icon_size,
+            fill="#ff4444", outline="#cc3333", width=1, tags=("corner_icons", "close_icon")
+        )
+        
+        # Draw × symbol
+        line_margin = icon_size // 4
+        self.canvas.create_line(
+            close_x + line_margin, close_y + line_margin,
+            close_x + icon_size - line_margin, close_y + icon_size - line_margin,
+            fill="white", width=2, tags=("corner_icons", "close_icon")
+        )
+        self.canvas.create_line(
+            close_x + icon_size - line_margin, close_y + line_margin,
+            close_x + line_margin, close_y + icon_size - line_margin,
+            fill="white", width=2, tags=("corner_icons", "close_icon")
+        )
+        
+        # Lock icon
+        lock_x = close_x - icon_size - 6
+        lock_y = margin
+        
+        lock_color = "#ff8800" if self.drag_locked else "#666666"
+        self.canvas.create_oval(
+            lock_x, lock_y, lock_x + icon_size, lock_y + icon_size,
+            fill=lock_color, outline=lock_color, width=1, tags=("corner_icons", "lock_icon")
+        )
+        
+        # Draw lock symbol (rectangle with arc on top)
+        lock_inner = icon_size // 3
+        lock_center_x = lock_x + icon_size // 2
+        lock_center_y = lock_y + icon_size // 2
+        
+        # Lock body
+        self.canvas.create_rectangle(
+            lock_center_x - lock_inner//2, lock_center_y - lock_inner//4,
+            lock_center_x + lock_inner//2, lock_center_y + lock_inner//2,
+            fill="white", outline="white", tags=("corner_icons", "lock_icon")
+        )
+        
+        # Lock shackle (arc)
+        if self.drag_locked:
+            # Closed lock - full arc
+            self.canvas.create_arc(
+                lock_center_x - lock_inner//2, lock_center_y - lock_inner//2,
+                lock_center_x + lock_inner//2, lock_center_y + lock_inner//4,
+                start=0, extent=180, outline="white", width=2, style="arc",
+                tags=("corner_icons", "lock_icon")
+            )
+        else:
+            # Open lock - partial arc
+            self.canvas.create_arc(
+                lock_center_x - lock_inner//2, lock_center_y - lock_inner//2,
+                lock_center_x + lock_inner//2, lock_center_y + lock_inner//4,
+                start=20, extent=140, outline="white", width=2, style="arc",
+                tags=("corner_icons", "lock_icon")
+            )
+        
+        # Bind click events
+        self.canvas.tag_bind("close_icon", "<Button-1>", lambda e: self._on_close())
+        self.canvas.tag_bind("lock_icon", "<Button-1>", lambda e: self._toggle_drag_lock())
+
+    def _toggle_drag_lock(self):
+        """Toggle drag lock state"""
+        self.drag_locked = not self.drag_locked
+        logging.info(f"Drag lock {'enabled' if self.drag_locked else 'disabled'}")
+        self._draw_corner_icons()  # Refresh icon appearance
+
+    def _draw_resize_grip(self):
+        """Draw resize grip in bottom-right corner"""
+        self.canvas.delete("resize_grip")
+        
+        grip_size = 12
+        x = self.widget_size - grip_size - 2
+        y = self.widget_size - grip_size - 2
+        
+        # Draw three diagonal lines as resize grip
+        for i in range(3):
+            offset = i * 3
+            self.canvas.create_line(
+                x + offset, y + grip_size,
+                x + grip_size, y + offset,
+                fill="#999999", width=1, tags="resize_grip"
+            )
 
     def _draw_control_icons(self, is_playing: bool, hover_state: Optional[str] = None):
         self.canvas.delete("controls")
@@ -299,14 +497,14 @@ class SpotifyWidget:
         self.canvas.tag_bind("next_btn", "<Enter>", lambda e: self._draw_control_icons(self.is_playing, "next"))
         self.canvas.tag_bind("controls", "<Leave>", lambda e: self._draw_control_icons(self.is_playing, None))
 
-        if IS_WINDOWS:
-            self.canvas.tag_bind("prev_btn", "<Button-1>", lambda e: self._prev_track())
-            self.canvas.tag_bind("play_btn", "<Button-1>", lambda e: self._toggle_play_pause())
-            self.canvas.tag_bind("next_btn", "<Button-1>", lambda e: self._next_track())
+        # Bind click events for all platforms (not just Windows)
+        self.canvas.tag_bind("prev_btn", "<Button-1>", lambda e: self._prev_track())
+        self.canvas.tag_bind("play_btn", "<Button-1>", lambda e: self._toggle_play_pause())
+        self.canvas.tag_bind("next_btn", "<Button-1>", lambda e: self._next_track())
 
     def _draw_rounded_rect(self, x1, y1, x2, y2, radius, fill, alpha=1.0, tags=""):
         width, height = (x2 - x1), (y2 - y1)
-        cache_key = f"rect_{{fill}}_{{alpha}}_{{width}}x{{height}}_{{radius}}"
+        cache_key = f"rect_{fill}_{alpha}_{width}x{height}_{radius}"
         img_ref = getattr(self, "_overlay_cache", {}).get(cache_key)
         if img_ref is None:
             img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -321,7 +519,7 @@ class SpotifyWidget:
     def _spotify_update_loop(self):
         try:
             logging.info("Authorizing with Spotify...")
-            scope = "user-read-playback-state"
+            scope = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
             auth_manager = SpotifyOAuth(
                 client_id=self.config.CLIENT_ID,
                 client_secret=self.config.CLIENT_SECRET,
@@ -338,12 +536,14 @@ class SpotifyWidget:
             with self._state_lock:
                 self._song_state = {"song_name": "Auth Error"}
                 self.is_playing = False
-            self.root.after(0, self.update_ui_with_state)
+            self._schedule_ui_update(self.update_ui_with_state)
             return
 
         while not self._stop_event.is_set():
             self._fetch_playback_data(schedule_ui=True)
-            for _ in range(int(UPDATE_DELAY_S * 10)):
+            # Use performance-aware polling delay
+            poll_delay = NETWORK_POLL_DELAY / 1000.0  # Convert to seconds
+            for _ in range(int(poll_delay * 10)):
                 if self._stop_event.is_set():
                     break
                 time.sleep(0.1)
@@ -363,12 +563,22 @@ class SpotifyWidget:
 
                 album_art_pil = None
                 if new_album_art_url and new_album_art_url != (self._song_state.get("album_art_url")):
-                    try:
-                        resp = requests.get(new_album_art_url, timeout=NETWORK_TIMEOUT)
-                        resp.raise_for_status()
-                        album_art_pil = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-                    except Exception:
-                        logging.exception("Album art fetch error")
+                    # Check cache first for performance
+                    album_art_pil = self._album_art_cache.get(new_album_art_url)
+                    if album_art_pil is None:
+                        try:
+                            resp = requests.get(new_album_art_url, timeout=NETWORK_TIMEOUT)
+                            resp.raise_for_status()
+                            album_art_pil = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                            # Cache the album art
+                            self._album_art_cache[new_album_art_url] = album_art_pil
+                            # Limit cache size in LOW_END_MODE
+                            if LOW_END_MODE and len(self._album_art_cache) > 5:
+                                # Remove oldest entries
+                                oldest_key = next(iter(self._album_art_cache))
+                                del self._album_art_cache[oldest_key]
+                        except Exception:
+                            logging.exception("Album art fetch error")
 
                 with self._state_lock:
                     if album_art_pil is not None:
@@ -393,7 +603,8 @@ class SpotifyWidget:
                     self._song_state = {}
 
             if schedule_ui:
-                self.root.after(0, self.update_ui_with_state)
+                # Use thread-safe UI update
+                self._schedule_ui_update(self.update_ui_with_state)
 
         except Exception:
             logging.exception("Spotify API error")
@@ -420,7 +631,9 @@ class SpotifyWidget:
         except Exception:
             logging.exception("Progress bar error")
         finally:
-            self._progress_after_id = self.root.after(50, self._animate_progress_bar)
+            # Use performance-aware refresh rate
+            refresh_delay = int(1000 / PROGRESS_BAR_FPS)
+            self._progress_after_id = self.root.after(refresh_delay, self._animate_progress_bar)
 
     async def _win_control(self, action: str):
         try:
@@ -447,27 +660,88 @@ class SpotifyWidget:
             pass
 
     def _toggle_play_pause(self):
-        if IS_WINDOWS:
-            self._run_async(self._win_control("play_pause"))
+        """Toggle play/pause using both Windows API and Spotify Web API"""
+        def control_task():
+            try:
+                # Try Spotify Web API first
+                if self.sp:
+                    try:
+                        playback = self.sp.current_playback()
+                        if playback and playback.get("is_playing"):
+                            self.sp.pause_playback()
+                            logging.info("Paused via Spotify API")
+                        else:
+                            self.sp.start_playback()
+                            logging.info("Started playback via Spotify API")
+                    except Exception as e:
+                        logging.warning(f"Spotify API control failed: {e}")
+                        # Fallback to Windows API
+                        if IS_WINDOWS:
+                            asyncio.run(self._win_control("play_pause"))
+                else:
+                    # Fallback to Windows API
+                    if IS_WINDOWS:
+                        asyncio.run(self._win_control("play_pause"))
+            except Exception as e:
+                logging.exception(f"Play/pause control error: {e}")
+        
+        threading.Thread(target=control_task, daemon=True).start()
         self._button_click_animation("play_btn")
 
     def _next_track(self):
-        if IS_WINDOWS:
-            self._run_async(self._win_control("next"))
+        """Skip to next track using both Windows API and Spotify Web API"""
+        def control_task():
+            try:
+                # Try Spotify Web API first
+                if self.sp:
+                    try:
+                        self.sp.next_track()
+                        logging.info("Next track via Spotify API")
+                    except Exception as e:
+                        logging.warning(f"Spotify API next failed: {e}")
+                        # Fallback to Windows API
+                        if IS_WINDOWS:
+                            asyncio.run(self._win_control("next"))
+                else:
+                    # Fallback to Windows API
+                    if IS_WINDOWS:
+                        asyncio.run(self._win_control("next"))
+            except Exception as e:
+                logging.exception(f"Next track control error: {e}")
+        
+        threading.Thread(target=control_task, daemon=True).start()
         self._button_click_animation("next_btn")
 
     def _prev_track(self):
-        if IS_WINDOWS:
-            self._run_async(self._win_control("prev"))
+        """Skip to previous track using both Windows API and Spotify Web API"""
+        def control_task():
+            try:
+                # Try Spotify Web API first
+                if self.sp:
+                    try:
+                        self.sp.previous_track()
+                        logging.info("Previous track via Spotify API")
+                    except Exception as e:
+                        logging.warning(f"Spotify API previous failed: {e}")
+                        # Fallback to Windows API
+                        if IS_WINDOWS:
+                            asyncio.run(self._win_control("prev"))
+                else:
+                    # Fallback to Windows API
+                    if IS_WINDOWS:
+                        asyncio.run(self._win_control("prev"))
+            except Exception as e:
+                logging.exception(f"Previous track control error: {e}")
+        
+        threading.Thread(target=control_task, daemon=True).start()
         self._button_click_animation("prev_btn")
 
 
 def main():
+    # Widget can now work on all platforms via Spotify Web API
+    # Windows-specific features will be safely disabled on other platforms
     if not IS_WINDOWS:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Unsupported OS", "This widget requires Windows for playback control.")
-        return
+        logging.info("Running on non-Windows platform - Windows media controls disabled, using Spotify Web API only")
 
     config_path = resource_path(CONFIG_FILE)
     if not os.path.exists(config_path):
