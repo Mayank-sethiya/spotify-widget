@@ -1,6 +1,6 @@
 # MeloBox - A Spotify Mini-Player Widget for Windows
 
-![MeloBox Screenshot](https://drive.google.com/file/d/1qFOvlUS-N5MCH1Gp5MXyH3VNj65VFAr6/view?usp=sharing) <!-- It's highly recommended to replace this with a GIF of your widget in action! -->
+![MeloBox Screenshot](https://drive.google.com/file/d/1qFOvlUS-N5MCH1Gp5MXyH3VNj65VFAr6/view?usp=sharing)
 
 Bring your music to the forefront of your desktop experience! **MeloBox** is a sleek and minimalist Spotify widget for Windows that lets you see what's playing at a glance. Never again will you have to switch windows or interrupt your workflow just to check a song title.
 
