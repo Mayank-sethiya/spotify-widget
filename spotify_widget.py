@@ -10,6 +10,7 @@ import os
 import sys
 import asyncio
 import logging
+import queue
 
 # Image + network
 from PIL import Image, ImageTk, ImageDraw
@@ -47,6 +48,13 @@ PIN_TO_DESKTOP = True
 # Safe-mode toggles via env vars
 ENABLE_TRANSPARENCY = os.getenv("ENABLE_TRANSPARENCY", "0") == "1"
 DEBUG = os.getenv("DEBUG", "0") == "1"
+LOW_END_MODE = os.getenv("LOW_END_MODE", "0") == "1"
+PIN_TO_DESKTOP = os.getenv("PIN_TO_DESKTOP", "1") == "1" if IS_WINDOWS else False
+
+# Performance settings based on LOW_END_MODE
+PROGRESS_BAR_FPS = 4 if LOW_END_MODE else 20
+UI_REFRESH_DELAY = 250 if LOW_END_MODE else 50
+NETWORK_POLL_DELAY = 1000 if LOW_END_MODE else 750
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
@@ -54,12 +62,23 @@ logging.basicConfig(
     handlers=[logging.FileHandler("widget.log", mode="w", encoding="utf-8"), logging.StreamHandler(sys.stdout)],
 )
 
+# Log configuration at startup
+logging.info("Spotify Widget starting up")
+logging.info(f"LOW_END_MODE: {LOW_END_MODE}")
+logging.info(f"PIN_TO_DESKTOP: {PIN_TO_DESKTOP}")
+logging.info(f"ENABLE_TRANSPARENCY: {ENABLE_TRANSPARENCY}")
+logging.info(f"DEBUG: {DEBUG}")
+logging.info(f"Progress bar FPS: {PROGRESS_BAR_FPS}")
+logging.info(f"UI refresh delay: {UI_REFRESH_DELAY}ms")
+
+
 def resource_path(relative_path: str) -> str:
     try:
         base_path = sys._MEIPASS  # type: ignore[attr-defined]
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
 
 def create_rounded_image(pil_image: Image.Image, size: tuple[int, int], radius: int) -> Image.Image:
     mask = Image.new("L", size, 0)
@@ -69,8 +88,10 @@ def create_rounded_image(pil_image: Image.Image, size: tuple[int, int], radius: 
     output.putalpha(mask)
     return output
 
+
 def rgb_to_8bit_tuple(rgb16: tuple[int, int, int]) -> tuple[int, int, int]:
     return tuple(int(v / 257) for v in rgb16)
+
 
 def pin_to_desktop(hwnd):
     """Attempt to pin the window to the Windows desktop layer."""
@@ -129,11 +150,13 @@ def pin_to_desktop(hwnd):
         logging.warning(f"Desktop pinning failed: {e}")
         return False
 
+
 @dataclass
 class AppConfig:
     CLIENT_ID: str
     CLIENT_SECRET: str
     USERNAME: str
+
 
 class SetupWindow:
     def __init__(self, root: tk.Tk):
@@ -174,6 +197,7 @@ class SetupWindow:
         messagebox.showinfo("Success", "Configuration saved! The widget will now start.")
         self.root.destroy()
 
+
 class SpotifyWidget:
     def __init__(self, root: tk.Tk, config: AppConfig):
         self.root = root
@@ -182,6 +206,16 @@ class SpotifyWidget:
         self._is_resizing = False
         self._resize_start_pos = None
         self._start_size = None
+
+        # Thread-safe UI update queue
+        self.ui_queue = queue.Queue()
+        self._process_ui_queue()
+
+        # State tracking
+        self.drag_locked = False
+        self._last_x = 0
+        self._last_y = 0
+        self._pinned_to_desktop = False
 
         self.root.overrideredirect(True)
         self.root.geometry(f"{self.widget_size}x{self.widget_size}+200+200")
@@ -195,10 +229,6 @@ class SpotifyWidget:
         self.root.attributes("-topmost", False)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Try to pin to desktop on Windows
-        if IS_WINDOWS and PIN_TO_DESKTOP:
-            self.root.after(100, self._try_pin_to_desktop)
-
         self.canvas = tk.Canvas(root, bg="grey", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
@@ -207,25 +237,49 @@ class SpotifyWidget:
         self.is_playing = False
 
         self._state_lock = threading.Lock()
-        self._song_state: Dict[str, Any] = {}
+               self._song_state: Dict[str, Any] = {}
         self.tk_image_references: Dict[str, ImageTk.PhotoImage] = {}
         self._album_art_cache_key: Optional[str] = None
+        self._album_art_cache: Dict[str, Image.Image] = {}  # Cache album art by URL
         self._stop_event = threading.Event()
         self._overlay_cache: Dict[str, ImageTk.PhotoImage] = {}
 
         self._bind_events()
         self.update_ui_with_state()
 
+        # Pin to desktop on Windows if enabled
+        if IS_WINDOWS and PIN_TO_DESKTOP:
+            self._pin_to_desktop()
+
         logging.info("Starting Spotify background thread")
         self._spotify_thread = threading.Thread(target=self._spotify_update_loop, daemon=True, name="SpotifyLoop")
         self._spotify_thread.start()
         self._animate_progress_bar()
+
+    def _process_ui_queue(self):
+        """Process UI updates from background threads safely on main thread"""
+        try:
+            while True:
+                try:
+                    update_func = self.ui_queue.get_nowait()
+                    update_func()
+                except queue.Empty:
+                    break
+        except Exception as e:
+            logging.exception(f"UI queue processing error: {e}")
+        finally:
+            self.root.after(100, self._process_ui_queue)
+
+    def _schedule_ui_update(self, update_func):
+        """Thread-safe way to schedule UI updates from background threads"""
+        self.ui_queue.put(update_func)
 
     def _try_pin_to_desktop(self):
         """Try to pin the window to desktop after it's fully initialized."""
         try:
             hwnd = self.root.winfo_id()
             if pin_to_desktop(hwnd):
+                self._pinned_to_desktop = True
                 logging.info("Widget pinned to desktop successfully")
             else:
                 logging.info("Running as normal window (desktop pinning failed)")
@@ -237,9 +291,10 @@ class SpotifyWidget:
         self.canvas.bind("<B1-Motion>", self._do_move_or_resize)
         self.canvas.bind("<ButtonRelease-1>", self._end_move_or_resize)
         self.canvas.bind("<Button-2>", self._force_refresh)
-        self.canvas.bind("<Button-3>", lambda e: self._on_close())
+        # Right-click: context menu
+        self.canvas.bind("<Button-3>", self._show_context_menu)
         
-        # Ctrl+MouseWheel for resizing
+        # Ctrl+MouseWheel for resizing (Windows + Linux)
         self.root.bind("<Control-MouseWheel>", self._ctrl_mousewheel_resize)
         self.root.bind("<Control-Button-4>", self._ctrl_mousewheel_resize)  # Linux scroll up
         self.root.bind("<Control-Button-5>", self._ctrl_mousewheel_resize)  # Linux scroll down
@@ -251,6 +306,8 @@ class SpotifyWidget:
                 y >= self.widget_size - handle_size)
 
     def _start_move_or_resize(self, event):
+        if self.drag_locked:
+            return
         if self._is_in_resize_handle(event.x, event.y):
             self._is_resizing = True
             self._resize_start_pos = (event.x_root, event.y_root)
@@ -274,6 +331,8 @@ class SpotifyWidget:
                     self._resize_widget(new_size)
             else:
                 # Handle moving
+                if self.drag_locked:
+                    return
                 deltax, deltay = event.x - self._x, event.y - self._y
                 new_x = self.root.winfo_x() + deltax
                 new_y = self.root.winfo_y() + deltay
@@ -294,9 +353,9 @@ class SpotifyWidget:
             delta = event.delta
         else:
             # Linux
-            if event.num == 4:
+            if getattr(event, "num", None) == 4:
                 delta = 120
-            elif event.num == 5:
+            elif getattr(event, "num", None) == 5:
                 delta = -120
             else:
                 return
@@ -317,8 +376,28 @@ class SpotifyWidget:
         self._album_art_cache_key = None  # Force album art to be regenerated
         self.root.after_idle(self.update_ui_with_state)
 
+    def _show_context_menu(self, event):
+        """Show context menu with additional options"""
+        try:
+            context_menu = tk.Menu(self.root, tearoff=0)
+            context_menu.add_command(label="Select Device", command=self._show_device_picker)
+            context_menu.add_command(label="Refresh", command=self._force_refresh)
+            context_menu.add_separator()
+            context_menu.add_command(label=f"{'Unlock' if self.drag_locked else 'Lock'} Position", command=self._toggle_drag_lock)
+            if IS_WINDOWS:
+                pin_text = "Unpin from Desktop" if self._pinned_to_desktop else "Pin to Desktop"
+                context_menu.add_command(label=pin_text, command=self._toggle_desktop_pin)
+            context_menu.add_separator()
+            context_menu.add_command(label="Exit", command=self._on_close)
+            
+            context_menu.post(event.x_root, event.y_root)
+        except Exception as e:
+            logging.exception(f"Context menu error: {e}")
+
     def _force_refresh(self, _event=None):
-        self._fetch_playback_data(schedule_ui=True)
+        def refresh_task():
+            self._fetch_playback_data(schedule_ui=True)
+        threading.Thread(target=refresh_task, daemon=True).start()
 
     def _on_close(self):
         self._stop_event.set()
@@ -350,7 +429,7 @@ class SpotifyWidget:
 
             self._create_overlay_elements(song_info, is_playing)
         except Exception as e:
-            logging.exception(f"UI update error: {{e}}")
+            logging.exception(f"UI update error: {e}")
 
     def _create_overlay_elements(self, song_info: Dict[str, Any], is_playing: bool):
         if song_info.get("song_name"):
@@ -361,6 +440,9 @@ class SpotifyWidget:
             artist_name_text = "Hover to control"
 
         self._draw_rounded_rect(0, 0, self.widget_size, self.widget_size, CORNER_RADIUS, "black", alpha=OVERLAY_ALPHA, tags="overlay")
+
+        # Add close and lock icons in top-right corner
+        self._draw_corner_icons()
 
         font_size_song = max(9, int(self.widget_size / 16))
         font_size_artist = max(8, int(self.widget_size / 20))
@@ -382,6 +464,263 @@ class SpotifyWidget:
 
         self._draw_control_icons(is_playing)
         self._draw_resize_grip()
+
+    def _draw_corner_icons(self):
+        """Draw close and lock icons in top-right corner"""
+        self.canvas.delete("corner_icons")
+        
+        icon_size = max(16, self.widget_size // 15)
+        margin = 8
+        
+        # Close icon (×)
+        close_x = self.widget_size - margin - icon_size
+        close_y = margin
+        
+        self.canvas.create_oval(
+            close_x, close_y, close_x + icon_size, close_y + icon_size,
+            fill="#ff4444", outline="#cc3333", width=1, tags=("corner_icons", "close_icon")
+        )
+        
+        # Draw × symbol
+        line_margin = icon_size // 4
+        self.canvas.create_line(
+            close_x + line_margin, close_y + line_margin,
+            close_x + icon_size - line_margin, close_y + icon_size - line_margin,
+            fill="white", width=2, tags=("corner_icons", "close_icon")
+        )
+        self.canvas.create_line(
+            close_x + icon_size - line_margin, close_y + line_margin,
+            close_x + line_margin, close_y + icon_size - line_margin,
+            fill="white", width=2, tags=("corner_icons", "close_icon")
+        )
+        
+        # Lock icon
+        lock_x = close_x - icon_size - 6
+        lock_y = margin
+        
+        lock_color = "#ff8800" if self.drag_locked else "#666666"
+        self.canvas.create_oval(
+            lock_x, lock_y, lock_x + icon_size, lock_y + icon_size,
+            fill=lock_color, outline=lock_color, width=1, tags=("corner_icons", "lock_icon")
+        )
+        
+        # Draw lock symbol (rectangle with arc on top)
+        lock_inner = icon_size // 3
+        lock_center_x = lock_x + icon_size // 2
+        lock_center_y = lock_y + icon_size // 2
+        
+        # Lock body
+        self.canvas.create_rectangle(
+            lock_center_x - lock_inner//2, lock_center_y - lock_inner//4,
+            lock_center_x + lock_inner//2, lock_center_y + lock_inner//2,
+            fill="white", outline="white", tags=("corner_icons", "lock_icon")
+        )
+        
+        # Lock shackle
+        if self.drag_locked:
+            # Closed lock - full arc
+            self.canvas.create_arc(
+                lock_center_x - lock_inner//2, lock_center_y - lock_inner//2,
+                lock_center_x + lock_inner//2, lock_center_y + lock_inner//4,
+                start=0, extent=180, outline="white", width=2, style="arc",
+                tags=("corner_icons", "lock_icon")
+            )
+        else:
+            # Open lock - partial arc
+            self.canvas.create_arc(
+                lock_center_x - lock_inner//2, lock_center_y - lock_inner//2,
+                lock_center_x + lock_inner//2, lock_center_y + lock_inner//4,
+                start=20, extent=140, outline="white", width=2, style="arc",
+                tags=("corner_icons", "lock_icon")
+            )
+        
+        # Bind click events
+        self.canvas.tag_bind("close_icon", "<Button-1>", lambda e: self._on_close())
+        self.canvas.tag_bind("lock_icon", "<Button-1>", lambda e: self._toggle_drag_lock())
+
+    def _toggle_drag_lock(self):
+        """Toggle drag lock state"""
+        self.drag_locked = not self.drag_locked
+        logging.info(f"Drag lock {'enabled' if self.drag_locked else 'disabled'}")
+        self._draw_corner_icons()  # Refresh icon appearance
+
+    def _draw_resize_grip(self):
+        """Draw a subtle resize grip in the bottom-right corner."""
+        grip_size = 12
+        grip_x = self.widget_size - grip_size - 4
+        grip_y = self.widget_size - grip_size - 4
+        
+        # Draw small diagonal lines to indicate resize handle
+        for i in range(3):
+            x1 = grip_x + i * 3
+            y1 = grip_y + grip_size - 2
+            x2 = grip_x + grip_size - 2
+            y2 = grip_y + i * 3
+            self.canvas.create_line(x1, y1, x2, y2, fill="white", width=1, tags="resize_grip")
+            # Add subtle shadow
+            self.canvas.create_line(x1+1, y1+1, x2+1, y2+1, fill="black", width=1, tags="resize_grip")
+
+    def _draw_rounded_rect(self, x1, y1, x2, y2, radius, fill, alpha=1.0, tags=""):
+        width, height = (x2 - x1), (y2 - y1)
+        cache_key = f"rect_{fill}_{alpha}_{width}x{height}_{radius}"
+        img_ref = getattr(self, "_overlay_cache", {}).get(cache_key)
+        if img_ref is None:
+            img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            rgba = rgb_to_8bit_tuple(self.root.winfo_rgb(fill)) + (int(alpha * 255),)
+            draw.rounded_rectangle((0, 0, width, height), radius, fill=rgba)
+            img_ref = ImageTk.PhotoImage(img)
+            self._overlay_cache[cache_key] = img_ref
+        self.canvas.create_image(x1, y1, anchor="nw", image=img_ref, tags=tags)
+        self.tk_image_references[cache_key] = img_ref
+
+    def _get_available_devices(self):
+        """Get list of available Spotify Connect devices"""
+        try:
+            if self.sp:
+                devices = self.sp.devices()
+                return devices.get("devices", [])
+        except Exception as e:
+            logging.exception(f"Failed to get devices: {e}")
+        return []
+
+    def _show_device_picker(self):
+        """Show device picker dialog"""
+        devices = self._get_available_devices()
+        if not devices:
+            messagebox.showinfo("No Devices", "No Spotify Connect devices found. Make sure Spotify is running on at least one device.")
+            return
+
+        # Create device picker window
+        device_window = tk.Toplevel(self.root)
+        device_window.title("Select Spotify Device")
+        device_window.geometry("300x200")
+        device_window.resizable(False, False)
+        device_window.attributes("-topmost", True)
+
+        tk.Label(device_window, text="Select device for playback:", font=(FONT_NAME, 10)).pack(pady=10)
+
+        # Device listbox
+        listbox = tk.Listbox(device_window, font=(FONT_NAME, 9))
+        listbox.pack(fill="both", expand=True, padx=10, pady=5)
+
+        device_info = []
+        for device in devices:
+            name = device.get("name", "Unknown Device")
+            device_type = device.get("type", "").title()
+            is_active = device.get("is_active", False)
+            status = " (Active)" if is_active else ""
+            display_text = f"{name} - {device_type}{status}"
+            listbox.insert(tk.END, display_text)
+            device_info.append(device)
+
+        def transfer_to_selected():
+            try:
+                selection = listbox.curselection()
+                if selection:
+                    device = device_info[selection[0]]
+                    device_id = device.get("id")
+                    if device_id:
+                        self._transfer_playback(device_id)
+                        device_window.destroy()
+                else:
+                    messagebox.showwarning("No Selection", "Please select a device.")
+            except Exception as e:
+                logging.exception(f"Device selection error: {e}")
+
+        button_frame = tk.Frame(device_window)
+        button_frame.pack(pady=10)
+        
+        tk.Button(button_frame, text="Transfer Playback", command=transfer_to_selected).pack(side="left", padx=5)
+        tk.Button(button_frame, text="Cancel", command=device_window.destroy).pack(side="left", padx=5)
+
+        # Select current active device if any
+        for i, device in enumerate(device_info):
+            if device.get("is_active"):
+                listbox.selection_set(i)
+                break
+
+    def _transfer_playback(self, device_id: str):
+        """Transfer playback to specified device"""
+        def transfer_task():
+            try:
+                if self.sp:
+                    self.sp.transfer_playback(device_id, force_play=True)
+                    logging.info(f"Transferred playback to device: {device_id}")
+                    # Refresh playback state after transfer
+                    time.sleep(1)  # Give it a moment to transfer
+                    self._fetch_playback_data(schedule_ui=True)
+            except Exception as e:
+                logging.exception(f"Failed to transfer playback: {e}")
+                self._schedule_ui_update(lambda: messagebox.showerror("Transfer Failed", f"Could not transfer playback: {e}"))
+        
+        threading.Thread(target=transfer_task, daemon=True).start()
+
+    def _pin_to_desktop(self):
+        """Pin widget to Windows desktop (behind icons) and set internal flag"""
+        if not IS_WINDOWS or not PIN_TO_DESKTOP:
+            return
+            
+        try:
+            import ctypes
+            from ctypes import wintypes
+            
+            # Get window handle
+            hwnd = self.root.winfo_id()
+            
+            # Trigger creation of WorkerW by sending message to Program Manager
+            progman = ctypes.windll.user32.FindWindowW("Progman", None)
+            ctypes.windll.user32.SendMessageW(progman, 0x052C, 0xD, 0)
+            ctypes.windll.user32.SendMessageW(progman, 0x052C, 0xD, 1)
+            
+            # Find the desktop WorkerW window
+            def enum_windows_proc(hwnd_enum, lparam):
+                class_name = ctypes.create_unicode_buffer(256)
+                ctypes.windll.user32.GetClassNameW(hwnd_enum, class_name, 256)
+                if class_name.value == "WorkerW":
+                    # Check if this WorkerW contains the desktop listview
+                    child_hwnd = ctypes.windll.user32.FindWindowExW(hwnd_enum, 0, "SHELLDLL_DefView", None)
+                    if child_hwnd:
+                        lparam.contents = wintypes.HWND(hwnd_enum)
+                        return False  # Stop enumeration
+                return True  # Continue enumeration
+            
+            workerw = wintypes.HWND()
+            EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            ctypes.windll.user32.EnumWindows(EnumProc(enum_windows_proc), ctypes.byref(workerw))
+            
+            if workerw.value:
+                # Set our window as child of WorkerW
+                ctypes.windll.user32.SetParent(hwnd, workerw.value)
+                self._pinned_to_desktop = True
+                logging.info("Successfully pinned to desktop")
+            else:
+                logging.warning("Could not find WorkerW window for desktop pinning")
+                
+        except Exception as e:
+            logging.warning(f"Desktop pinning failed: {e}")
+
+    def _unpin_from_desktop(self):
+        """Unpin widget from Windows desktop"""
+        if not IS_WINDOWS or not self._pinned_to_desktop:
+            return
+            
+        try:
+            import ctypes
+            hwnd = self.root.winfo_id()
+            # Remove from WorkerW and make it a normal window
+            ctypes.windll.user32.SetParent(hwnd, 0)
+            self._pinned_to_desktop = False
+            logging.info("Unpinned from desktop")
+        except Exception as e:
+            logging.warning(f"Desktop unpinning failed: {e}")
+
+    def _toggle_desktop_pin(self):
+        """Toggle desktop pinning state"""
+        if self._pinned_to_desktop:
+            self._unpin_from_desktop()
+        else:
+            self._pin_to_desktop()
 
     def _draw_control_icons(self, is_playing: bool, hover_state: Optional[str] = None):
         self.canvas.delete("controls")
@@ -441,45 +780,15 @@ class SpotifyWidget:
         self.canvas.tag_bind("next_btn", "<Enter>", lambda e: self._draw_control_icons(self.is_playing, "next"))
         self.canvas.tag_bind("controls", "<Leave>", lambda e: self._draw_control_icons(self.is_playing, None))
 
-        if IS_WINDOWS:
-            self.canvas.tag_bind("prev_btn", "<Button-1>", lambda e: self._prev_track())
-            self.canvas.tag_bind("play_btn", "<Button-1>", lambda e: self._toggle_play_pause())
-            self.canvas.tag_bind("next_btn", "<Button-1>", lambda e: self._next_track())
-
-    def _draw_resize_grip(self):
-        """Draw a subtle resize grip in the bottom-right corner."""
-        grip_size = 12
-        grip_x = self.widget_size - grip_size - 4
-        grip_y = self.widget_size - grip_size - 4
-        
-        # Draw small diagonal lines to indicate resize handle
-        for i in range(3):
-            x1 = grip_x + i * 3
-            y1 = grip_y + grip_size - 2
-            x2 = grip_x + grip_size - 2
-            y2 = grip_y + i * 3
-            self.canvas.create_line(x1, y1, x2, y2, fill="white", width=1, tags="resize_grip")
-            # Add subtle shadow
-            self.canvas.create_line(x1+1, y1+1, x2+1, y2+1, fill="black", width=1, tags="resize_grip")
-
-    def _draw_rounded_rect(self, x1, y1, x2, y2, radius, fill, alpha=1.0, tags=""):
-        width, height = (x2 - x1), (y2 - y1)
-        cache_key = f"rect_{fill}_{alpha}_{width}x{height}_{radius}"
-        img_ref = getattr(self, "_overlay_cache", {}).get(cache_key)
-        if img_ref is None:
-            img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(img)
-            rgba = rgb_to_8bit_tuple(self.root.winfo_rgb(fill)) + (int(alpha * 255),)
-            draw.rounded_rectangle((0, 0, width, height), radius, fill=rgba)
-            img_ref = ImageTk.PhotoImage(img)
-            self._overlay_cache[cache_key] = img_ref
-        self.canvas.create_image(x1, y1, anchor="nw", image=img_ref, tags=tags)
-        self.tk_image_references[cache_key] = img_ref
+        # Bind click events for all platforms (use Spotify API primarily; Windows SDK as fallback)
+        self.canvas.tag_bind("prev_btn", "<Button-1>", lambda e: self._prev_track())
+        self.canvas.tag_bind("play_btn", "<Button-1>", lambda e: self._toggle_play_pause())
+        self.canvas.tag_bind("next_btn", "<Button-1>", lambda e: self._next_track())
 
     def _spotify_update_loop(self):
         try:
             logging.info("Authorizing with Spotify...")
-            scope = "user-read-playback-state"
+            scope = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
             auth_manager = SpotifyOAuth(
                 client_id=self.config.CLIENT_ID,
                 client_secret=self.config.CLIENT_SECRET,
@@ -496,12 +805,14 @@ class SpotifyWidget:
             with self._state_lock:
                 self._song_state = {"song_name": "Auth Error"}
                 self.is_playing = False
-            self.root.after(0, self.update_ui_with_state)
+            self._schedule_ui_update(self.update_ui_with_state)
             return
 
         while not self._stop_event.is_set():
             self._fetch_playback_data(schedule_ui=True)
-            for _ in range(int(UPDATE_DELAY_S * 10)):
+            # Use performance-aware polling delay
+            poll_delay = NETWORK_POLL_DELAY / 1000.0  # Convert to seconds
+            for _ in range(int(poll_delay * 10)):
                 if self._stop_event.is_set():
                     break
                 time.sleep(0.1)
@@ -521,12 +832,22 @@ class SpotifyWidget:
 
                 album_art_pil = None
                 if new_album_art_url and new_album_art_url != (self._song_state.get("album_art_url")):
-                    try:
-                        resp = requests.get(new_album_art_url, timeout=NETWORK_TIMEOUT)
-                        resp.raise_for_status()
-                        album_art_pil = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-                    except Exception:
-                        logging.exception("Album art fetch error")
+                    # Check cache first for performance
+                    album_art_pil = self._album_art_cache.get(new_album_art_url)
+                    if album_art_pil is None:
+                        try:
+                            resp = requests.get(new_album_art_url, timeout=NETWORK_TIMEOUT)
+                            resp.raise_for_status()
+                            album_art_pil = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                            # Cache the album art
+                            self._album_art_cache[new_album_art_url] = album_art_pil
+                            # Limit cache size in LOW_END_MODE
+                            if LOW_END_MODE and len(self._album_art_cache) > 5:
+                                # Remove oldest entries
+                                oldest_key = next(iter(self._album_art_cache))
+                                del self._album_art_cache[oldest_key]
+                        except Exception:
+                            logging.exception("Album art fetch error")
 
                 with self._state_lock:
                     if album_art_pil is not None:
@@ -551,7 +872,8 @@ class SpotifyWidget:
                     self._song_state = {}
 
             if schedule_ui:
-                self.root.after(0, self.update_ui_with_state)
+                # Use thread-safe UI update
+                self._schedule_ui_update(self.update_ui_with_state)
 
         except Exception:
             logging.exception("Spotify API error")
@@ -578,7 +900,9 @@ class SpotifyWidget:
         except Exception:
             logging.exception("Progress bar error")
         finally:
-            self._progress_after_id = self.root.after(50, self._animate_progress_bar)
+            # Use performance-aware refresh rate
+            refresh_delay = int(1000 / PROGRESS_BAR_FPS)
+            self._progress_after_id = self.root.after(refresh_delay, self._animate_progress_bar)
 
     async def _win_control(self, action: str):
         try:
@@ -604,28 +928,113 @@ class SpotifyWidget:
         except Exception:
             pass
 
+    def _handle_spotify_api_error(self, error, action):
+        """Handle Spotify API errors with user-friendly messages"""
+        error_msg = str(error)
+        if "No active device found" in error_msg:
+            self._schedule_ui_update(lambda: messagebox.showwarning(
+                "No Active Device", 
+                f"Cannot {action}: No active Spotify device found.\n\nPlease:\n1. Open Spotify on any device\n2. Start playing something\n3. Try again, or use 'Select Device' to transfer playback."
+            ))
+        elif "Insufficient client scope" in error_msg:
+            self._schedule_ui_update(lambda: messagebox.showerror(
+                "Permission Error",
+                f"Cannot {action}: Insufficient permissions.\n\nPlease restart the widget to re-authorize with required permissions."
+            ))
+        elif "Device not found" in error_msg:
+            self._schedule_ui_update(lambda: messagebox.showwarning(
+                "Device Error",
+                f"Cannot {action}: Selected device is no longer available.\n\nTry selecting a different device."
+            ))
+        else:
+            self._schedule_ui_update(lambda: messagebox.showerror(
+                "Spotify Error",
+                f"Cannot {action}: {error_msg[:100]}..."
+            ))
+
     def _toggle_play_pause(self):
-        if IS_WINDOWS:
-            self._run_async(self._win_control("play_pause"))
+        """Toggle play/pause using both Windows API and Spotify Web API"""
+        def control_task():
+            try:
+                # Try Spotify Web API first
+                if self.sp:
+                    try:
+                        playback = self.sp.current_playback()
+                        if playback and playback.get("is_playing"):
+                            self.sp.pause_playback()
+                            logging.info("Paused via Spotify API")
+                        else:
+                            self.sp.start_playback()
+                            logging.info("Started playback via Spotify API")
+                    except Exception as e:
+                        self._handle_spotify_api_error(e, "play/pause")
+                        # Fallback to Windows API
+                        if IS_WINDOWS:
+                            asyncio.run(self._win_control("play_pause"))
+                else:
+                    # Fallback to Windows API
+                    if IS_WINDOWS:
+                        asyncio.run(self._win_control("play_pause"))
+            except Exception as e:
+                logging.exception(f"Play/pause control error: {e}")
+        
+        threading.Thread(target=control_task, daemon=True).start()
         self._button_click_animation("play_btn")
 
     def _next_track(self):
-        if IS_WINDOWS:
-            self._run_async(self._win_control("next"))
+        """Skip to next track using both Windows API and Spotify Web API"""
+        def control_task():
+            try:
+                # Try Spotify Web API first
+                if self.sp:
+                    try:
+                        self.sp.next_track()
+                        logging.info("Next track via Spotify API")
+                    except Exception as e:
+                        self._handle_spotify_api_error(e, "skip to next track")
+                        # Fallback to Windows API
+                        if IS_WINDOWS:
+                            asyncio.run(self._win_control("next"))
+                else:
+                    # Fallback to Windows API
+                    if IS_WINDOWS:
+                        asyncio.run(self._win_control("next"))
+            except Exception as e:
+                logging.exception(f"Next track control error: {e}")
+        
+        threading.Thread(target=control_task, daemon=True).start()
         self._button_click_animation("next_btn")
 
     def _prev_track(self):
-        if IS_WINDOWS:
-            self._run_async(self._win_control("prev"))
+        """Skip to previous track using both Windows API and Spotify Web API"""
+        def control_task():
+            try:
+                # Try Spotify Web API first
+                if self.sp:
+                    try:
+                        self.sp.previous_track()
+                        logging.info("Previous track via Spotify API")
+                    except Exception as e:
+                        self._handle_spotify_api_error(e, "skip to previous track")
+                        # Fallback to Windows API
+                        if IS_WINDOWS:
+                            asyncio.run(self._win_control("prev"))
+                else:
+                    # Fallback to Windows API
+                    if IS_WINDOWS:
+                        asyncio.run(self._win_control("prev"))
+            except Exception as e:
+                logging.exception(f"Previous track control error: {e}")
+        
+        threading.Thread(target=control_task, daemon=True).start()
         self._button_click_animation("prev_btn")
 
 
 def main():
+    # Widget can now work on all platforms via Spotify Web API
+    # Windows-specific features will be safely disabled on other platforms
     if not IS_WINDOWS:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Unsupported OS", "This widget requires Windows for playback control.")
-        return
+        logging.info("Running on non-Windows platform - Windows media controls disabled, using Spotify Web API only")
 
     config_path = resource_path(CONFIG_FILE)
     if not os.path.exists(config_path):
