@@ -1,40 +1,54 @@
-# MeloBox - A Spotify Mini-Player Widget for Windows
+🎵 Melo Box - The Ultimate Windows Media Widget
+Bring your music and media to the forefront of your desktop experience! Melo Box is a sleek, highly advanced, and minimalist media widget for Windows.
 
-![MeloBox Screenshot](https://drive.google.com/file/d/1qFOvlUS-N5MCH1Gp5MXyH3VNj65VFAr6/view?usp=sharing)
+No more switching windows or interrupting your workflow. Whether you are listening on Spotify, watching a video on Chrome, or playing local files on VLC, Melo Box automatically syncs, grabs the album art, and gives you beautiful, frictionless control right from your desktop.
 
-Bring your music to the forefront of your desktop experience! **MeloBox** is a sleek and minimalist Spotify widget for Windows that lets you see what's playing at a glance. Never again will you have to switch windows or interrupt your workflow just to check a song title.
+✨ What's New in v20.0 (The Big Update!)
+Melo Box has been completely rewritten to be a true, standalone desktop widget (completely hidden from your taskbar) with universal media support.
 
-## ✨ Features
+🌐 Universal Media Support: Works natively with Spotify, Google Chrome, Brave, Microsoft Edge, Firefox, and VLC.
 
-*   **Now Playing Display:** Clearly shows the current track title and artist.
-*   **Album Art:** Displays the beautiful album artwork for the current song.
-*   **Always on Top (Optional):** Pin the widget to stay on top of all your other windows.
-*   **Lightweight:** Designed to be simple and use minimal system resources.
-*   **Customizable:** (Coming soon!) Future updates will include options for changing the look and feel.
+🎛️ Full Interactive Controls: Play, pause, skip tracks, and adjust your system volume directly from the widget.
 
-## 🚀 Download Now
+⏪ Scrub & Seek: Click anywhere on the dynamic progress bar to instantly jump to your favorite part of a song or video.
 
-Get the latest version of MeloBox for free from Gumroad. Paying a small amount is optional but greatly appreciated and supports future development!
+👻 True Widget Experience: Completely hidden from your Windows Taskbar and Alt-Tab menu. It lives on your desktop like a native widget!
+
+📌 Fully Customizable Workspace: * Pin: Keep it "Always on Top" of other windows.
+
+Lock: Freeze its position so you don't accidentally drag it.
+
+Resize: Seamlessly scale it from a tiny mini-player to a massive display.
+
+Opacity: Right-click to make the widget semi-transparent.
+
+🖼️ Dynamic Visuals: Features smooth EQ animations, blurred background album art, and an idle "Slideshow Mode" that displays your recently played tracks when paused.
+
+⚡ Quick Action Menu: Right-click the widget to instantly bring your active media player to the front, switch between active sessions, or launch new apps.
+
+🚀 Download Now
+Get the latest standalone version of Melo Box from Gumroad. Paying a small amount is optional but greatly appreciated and directly supports future development and new features!
 
 <a href="https://monusethiya.gumroad.com/l/cotubm" target="_blank">
-  <img src="https://img.shields.io/badge/Download%20on-Gumroad-ff90e8?style=for-the-badge&logo=gumroad" alt="Download on Gumroad">
+<img src="https://img.shields.io/badge/Download%20on-Gumroad-ff90e8?style=for-the-badge&logo=gumroad" alt="Download on Gumroad">
 </a>
 
-## ⚙️ How to Use
+⚙️ How to Use
+Melo Box is now a portable .exe file. No installation or Python dependencies required!
 
-1.  **Download** the `Melo.Box.exe` file from the Gumroad link above.
-2.  **Run Spotify:** Make sure the Spotify desktop application is open and running on your Windows machine.
-3.  **Launch MeloBox:** Double-click the `Melo.Box.exe` file.
+Download the spotify_widget.exe file from the Gumroad link above.
 
-That's it! The widget will appear on your screen and automatically sync with Spotify.
+Play Something: Start playing music or video in Spotify, Chrome, Edge, Brave, VLC, or Firefox.
 
-## 🤝 Contributing
+Launch Melo Box: Double-click the .exe file.
 
-This project is currently a personal endeavor, but I'm open to feedback and suggestions! If you find a bug or have an idea for a new feature, please open an issue on this repository.
+Interact: * Hover over the widget to reveal the media controls, volume buttons, and progress bar.
 
-## 📄 License
+Drag the edges to resize it.
 
-This project is open-source. Feel free to use and modify it as you see fit.
+Right-click anywhere on the widget to open the Settings & Quick Launch menu.
 
----
-Made with ❤️ by Mayank Sethiya
+🤝 Built With
+Melo Box is proudly built using Python, integrating deeply with the native Windows System Media Transport Controls (SMTC) API for zero-lag media syncing.
+
+Created by Mayank Sethiya
