@@ -18,13 +18,6 @@ from pathlib import Path
 from PIL import Image, ImageTk, ImageDraw, ImageFilter
 from collections import OrderedDict
 
-# Sound
-try:
-    from playsound import playsound
-    PLAYSOUND_AVAILABLE = True
-except ImportError:
-    PLAYSOUND_AVAILABLE = False
-
 # Windows Media API
 try:
     from winsdk.windows.media.control import GlobalSystemMediaTransportControlsSessionManager
@@ -52,24 +45,30 @@ if IS_WINDOWS:
 else:
     NATIVE_CONTROLS_AVAILABLE = False
 
-# --- ABSOLUTE PATH FIX FOR WINDOWS .PYW ---
+# --- PATH FIX FOR STANDALONE EXE ---
 if getattr(sys, 'frozen', False):
-    BASE_DIR = Path(sys.executable).parent
+    # Running as compiled EXE
+    USER_DIR = Path(sys.executable).parent  # Where the .exe is saved (for config files)
+    BUNDLE_DIR = Path(sys._MEIPASS)         # Hidden temp folder where PyInstaller extracts assets
 else:
-    BASE_DIR = Path(__file__).parent.absolute()
+    # Running as normal Python script
+    USER_DIR = Path(__file__).parent.absolute()
+    BUNDLE_DIR = USER_DIR
 
-CONFIG_FILE = BASE_DIR / "config.json"
-GEOMETRY_FILE = BASE_DIR / "geometry.json"
+CONFIG_FILE = USER_DIR / "config.json"
+GEOMETRY_FILE = USER_DIR / "geometry.json"
 
-# ASSETS FOLDERS
-ASSETS_DIR = BASE_DIR / "assets"
-ASSETS_DIR.mkdir(exist_ok=True)
-
-COVERS_DIR = ASSETS_DIR / "covers"
-COVERS_DIR.mkdir(parents=True, exist_ok=True)
-
-ICON_CACHE_DIR = BASE_DIR / ".icon_cache"
+ICON_CACHE_DIR = USER_DIR / ".icon_cache"
 ICON_CACHE_DIR.mkdir(exist_ok=True)
+
+# Point ASSETS to the hidden bundled folder
+ASSETS_DIR = BUNDLE_DIR / "assets"
+COVERS_DIR = ASSETS_DIR / "covers"
+
+# Only create asset directories if we are NOT running the frozen exe
+if not getattr(sys, 'frozen', False):
+    ASSETS_DIR.mkdir(exist_ok=True)
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Env flags / toggles ---
 LOW_END_MODE = os.getenv("LOW_END_MODE", "0") == "1"
@@ -81,11 +80,6 @@ FONT_NAME = "Segoe UI"
 DISABLE_IMAGES = os.getenv("DISABLE_IMAGES", "0") == "1"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-def resource_path(relative_path: str) -> Path:
-    try: base_path = Path(sys._MEIPASS)
-    except AttributeError: base_path = ASSETS_DIR
-    return base_path / relative_path
 
 class LRUCache(OrderedDict):
     def __init__(self, max_size=10):
@@ -183,7 +177,17 @@ class UniversalMediaWidget:
         self.play_startup_sound = True
         self._load_config()
 
+        # --- SET THE ICON ---
+        icon_path = ASSETS_DIR / "melobox.ico"
+        if icon_path.exists():
+            try:
+                self.root.iconbitmap(str(icon_path))
+            except Exception as e:
+                logging.error(f"Failed to load icon: {e}")
+
+        # Hide window immediately to apply styling before it appears
         self.root.overrideredirect(True)
+        self.root.withdraw() 
         self.root.update_idletasks() # Ensure window is created in memory
         self._load_geometry()
 
@@ -191,18 +195,13 @@ class UniversalMediaWidget:
         if IS_WINDOWS:
             self._hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
 
-        # --- HIDE FROM ALT-TAB ---
+        # Bring the window back safely FIRST
+        self.root.deiconify()
+
+        # --- BULLETPROOF TASKBAR & ALT-TAB HIDING ---
         if IS_WINDOWS:
-            try:
-                GWL_EXSTYLE = -20
-                WS_EX_TOOLWINDOW = 0x00000080
-                WS_EX_APPWINDOW = 0x00040000
-                style = ctypes.windll.user32.GetWindowLongW(self._hwnd, GWL_EXSTYLE)
-                style = (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
-                ctypes.windll.user32.SetWindowLongW(self._hwnd, GWL_EXSTYLE, style)
-            except Exception as e:
-                logging.error(f"Failed to set ToolWindow style: {e}")
-        
+            self.root.after(10, self._hide_from_taskbar)
+
         self.root.config(bg="grey")
         self.root.attributes("-alpha", self.opacity)
         if IS_WINDOWS:
@@ -238,6 +237,27 @@ class UniversalMediaWidget:
         self._bind_events()
         
         self._run_startup_animation()
+
+    def _hide_from_taskbar(self):
+        """Removes the app from the Windows Taskbar natively."""
+        try:
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW = 0x00040000
+            
+            is_64bits = sys.maxsize > 2**32
+            if is_64bits:
+                GetWindowLong = ctypes.windll.user32.GetWindowLongPtrW
+                SetWindowLong = ctypes.windll.user32.SetWindowLongPtrW
+            else:
+                GetWindowLong = ctypes.windll.user32.GetWindowLongW
+                SetWindowLong = ctypes.windll.user32.SetWindowLongW
+                
+            style = GetWindowLong(self._hwnd, GWL_EXSTYLE)
+            style = (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+            SetWindowLong(self._hwnd, GWL_EXSTYLE, style)
+        except Exception as e:
+            logging.error(f"Failed to set ToolWindow style: {e}")
 
     def _load_config(self):
         if CONFIG_FILE.exists():
@@ -308,9 +328,10 @@ class UniversalMediaWidget:
         self.root.after(500, self._start_main_app)
 
     def _play_sound(self):
-        sound_file = resource_path("startup.wav")
-        if PLAYSOUND_AVAILABLE and sound_file.exists():
-            threading.Thread(target=lambda: playsound(str(sound_file)), daemon=True).start()
+        sound_file = ASSETS_DIR / "startup.wav"
+        if IS_WINDOWS and sound_file.exists():
+            import winsound
+            winsound.PlaySound(str(sound_file), winsound.SND_FILENAME | winsound.SND_ASYNC)
 
     def _start_main_app(self):
         self._queue_command("refresh")
@@ -320,7 +341,6 @@ class UniversalMediaWidget:
         self._schedule_task("eq_anim", 100, self._animate_eq_bars)
 
     def _fast_win_d_monitor(self):
-        """Dedicated high-speed thread to catch Win+D instantly, bypassing Tkinter GUI lag."""
         HWND_TOPMOST = -1
         SWP_NOMOVE = 0x0002
         SWP_NOSIZE = 0x0001
@@ -334,18 +354,13 @@ class UniversalMediaWidget:
                 if (lwin or rwin) and d_key:
                     if not self.is_pinned and not self._is_surviving_wind:
                         self._is_surviving_wind = True
-                        
-                        # Instantly force to OS TopMost (Zero delay)
                         USER32.SetWindowPos(self._hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
-                        
-                        # Queue the unpinning back on the main thread
                         self.root.after(800, self._restore_after_wind)
             except Exception:
                 pass
-            time.sleep(0.005) # 5ms loop - completely invisible CPU usage but blazingly fast
+            time.sleep(0.005)
 
     def _restore_after_wind(self):
-        """Unpins the widget and securely places it back on the desktop layer."""
         self._is_surviving_wind = False
         
         if not self.is_pinned:
@@ -355,9 +370,7 @@ class UniversalMediaWidget:
             SWP_NOSIZE = 0x0001
             SWP_NOACTIVATE = 0x0010
             
-            # Step 1: Remove TopMost flag
             USER32.SetWindowPos(self._hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-            # Step 2: Push firmly to the bottom layer
             USER32.SetWindowPos(self._hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
             self.root.wm_attributes("-topmost", False)
         else:
@@ -580,7 +593,6 @@ class UniversalMediaWidget:
         self._save_config()
         self._queue_command("refresh")
         
-        # If locking (without pinning), push the app strictly to the desktop layer
         if self.drag_locked and not self.is_pinned and IS_WINDOWS:
             try:
                 HWND_BOTTOM = 1
@@ -916,7 +928,9 @@ class UniversalMediaWidget:
         self.canvas.create_text(margin, y_pos, text="00:00", fill="lightgray", font=(FONT_NAME, font_size), anchor="w", tags="progress_time", state="hidden")
         self.canvas.create_text(self.widget_width - margin, y_pos, text="00:00", fill="lightgray", font=(FONT_NAME, font_size), anchor="e", tags="progress_dur", state="hidden")
 
-        self.canvas.create_rectangle(0, self.widget_height - 35, self.widget_width, self.widget_height, fill="", outline="", tags="progress_hitbox")
+        # Stop the hitbox 12 pixels above the bottom edge and 25 pixels from the right
+        # This prevents it from overlapping the bottom resize border and the bottom-right corner grip
+        self.canvas.create_rectangle(0, self.widget_height - 35, self.widget_width - 25, self.widget_height - 12, fill="", outline="", tags="progress_hitbox")
         self.canvas.tag_bind("progress_hitbox", "<Button-1>", self._seek_media)
         self.canvas.tag_bind("progress_hitbox", "<B1-Motion>", self._seek_media)
 
