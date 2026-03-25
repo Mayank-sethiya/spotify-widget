@@ -61,7 +61,7 @@ else:
 CONFIG_FILE = BASE_DIR / "config.json"
 GEOMETRY_FILE = BASE_DIR / "geometry.json"
 
-# ASSETS FOLDERS (Forces Windows to look right next to the script)
+# ASSETS FOLDERS
 ASSETS_DIR = BASE_DIR / "assets"
 ASSETS_DIR.mkdir(exist_ok=True)
 
@@ -184,7 +184,24 @@ class UniversalMediaWidget:
         self._load_config()
 
         self.root.overrideredirect(True)
+        self.root.update_idletasks() # Ensure window is created in memory
         self._load_geometry()
+
+        # Cache the OS-level HWND here for our background thread
+        if IS_WINDOWS:
+            self._hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+
+        # --- HIDE FROM ALT-TAB ---
+        if IS_WINDOWS:
+            try:
+                GWL_EXSTYLE = -20
+                WS_EX_TOOLWINDOW = 0x00000080
+                WS_EX_APPWINDOW = 0x00040000
+                style = ctypes.windll.user32.GetWindowLongW(self._hwnd, GWL_EXSTYLE)
+                style = (style & ~WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW
+                ctypes.windll.user32.SetWindowLongW(self._hwnd, GWL_EXSTYLE, style)
+            except Exception as e:
+                logging.error(f"Failed to set ToolWindow style: {e}")
         
         self.root.config(bg="grey")
         self.root.attributes("-alpha", self.opacity)
@@ -192,7 +209,12 @@ class UniversalMediaWidget:
             try: self.root.wm_attributes("-transparentcolor", "grey")
             except tk.TclError: pass
 
+        # Only pin if explicitly pinned
         self.root.wm_attributes("-topmost", self.is_pinned)
+        
+        # State for Win+D survival
+        self._is_surviving_wind = False
+        
         self.canvas = tk.Canvas(root, bg="grey", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
@@ -296,6 +318,50 @@ class UniversalMediaWidget:
         self._schedule_task("queue_consumer", 16, self._process_cmd_queue)
         self._schedule_task("progress_bar", 50, self._animate_progress_bar)
         self._schedule_task("eq_anim", 100, self._animate_eq_bars)
+
+    def _fast_win_d_monitor(self):
+        """Dedicated high-speed thread to catch Win+D instantly, bypassing Tkinter GUI lag."""
+        HWND_TOPMOST = -1
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        
+        while not self._stop_event.is_set():
+            try:
+                lwin = USER32.GetAsyncKeyState(0x5B) & 0x8000
+                rwin = USER32.GetAsyncKeyState(0x5C) & 0x8000
+                d_key = USER32.GetAsyncKeyState(0x44) & 0x8000
+                
+                if (lwin or rwin) and d_key:
+                    if not self.is_pinned and not self._is_surviving_wind:
+                        self._is_surviving_wind = True
+                        
+                        # Instantly force to OS TopMost (Zero delay)
+                        USER32.SetWindowPos(self._hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+                        
+                        # Queue the unpinning back on the main thread
+                        self.root.after(800, self._restore_after_wind)
+            except Exception:
+                pass
+            time.sleep(0.005) # 5ms loop - completely invisible CPU usage but blazingly fast
+
+    def _restore_after_wind(self):
+        """Unpins the widget and securely places it back on the desktop layer."""
+        self._is_surviving_wind = False
+        
+        if not self.is_pinned:
+            HWND_NOTOPMOST = -2
+            HWND_BOTTOM = 1
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_NOACTIVATE = 0x0010
+            
+            # Step 1: Remove TopMost flag
+            USER32.SetWindowPos(self._hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            # Step 2: Push firmly to the bottom layer
+            USER32.SetWindowPos(self._hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            self.root.wm_attributes("-topmost", False)
+        else:
+            self.root.wm_attributes("-topmost", True)
 
     def _load_geometry(self):
         try:
@@ -513,6 +579,13 @@ class UniversalMediaWidget:
         self.drag_locked = not self.drag_locked
         self._save_config()
         self._queue_command("refresh")
+        
+        # If locking (without pinning), push the app strictly to the desktop layer
+        if self.drag_locked and not self.is_pinned and IS_WINDOWS:
+            try:
+                HWND_BOTTOM = 1
+                USER32.SetWindowPos(self._hwnd, HWND_BOTTOM, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+            except Exception: pass
 
     def _on_close(self):
         self._save_geometry()
@@ -958,7 +1031,12 @@ class UniversalMediaWidget:
             except Exception as e: logging.error(f"Action {action} failed: {e}")
 
     def _start_background_tasks(self):
-        if WIN_MEDIA_AVAILABLE: threading.Thread(target=self._run_async_media_loop, daemon=True, name="WinMediaLoop").start()
+        if WIN_MEDIA_AVAILABLE: 
+            threading.Thread(target=self._run_async_media_loop, daemon=True, name="WinMediaLoop").start()
+            
+        if IS_WINDOWS:
+            # We start the dedicated Win+D thread here
+            threading.Thread(target=self._fast_win_d_monitor, daemon=True, name="WinDMonitor").start()
 
     def _run_async_media_loop(self):
         asyncio.run(self._media_poll_loop())
